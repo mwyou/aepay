@@ -1,0 +1,17 @@
+name = "aepay-worker"
+main = "src/index.ts"
+compatibility_date = "2026-05-23"
+
+[vars]
+APP_NAME = "AEPay"
+ORDER_EXPIRE_MINUTES = "15"
+AMOUNT_VARIANCE_CENTS = "30"
+COLLECT_ACCOUNT = ""
+COLLECT_QR_IMAGE_URL = ""
+ALIPAY_NOTIFY_VERIFY_REQUIRED = "true"
+EPAY_PID = "1000"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "aepay"
+database_id = "replace-with-your-d1-database-id"
