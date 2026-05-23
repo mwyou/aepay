@@ -1,0 +1,14 @@
+.venv/
+.env
+.pytest_cache/
+*.egg-info/
+*.db
+__pycache__/
+.DS_Store
+.wrangler/
+.tools/
+.home/
+.dev.vars
+wrangler.generated.toml
+node_modules/
+dist/
