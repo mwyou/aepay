@@ -1,0 +1,87 @@
+name: Deploy Cloudflare Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "migrations/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - "wrangler.toml"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Typecheck, migrate D1, deploy Worker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Generate Wrangler config
+        run: |
+          node - <<'NODE'
+          const fs = require("node:fs");
+          for (const name of ["CLOUDFLARE_D1_DATABASE_ID"]) {
+            if (!process.env[name]) {
+              throw new Error(`Missing required deployment setting: ${name}`);
+            }
+          }
+          const workerName = process.env.WORKER_NAME || "aepay-worker";
+          const databaseName = process.env.D1_DATABASE_NAME || "aepay";
+          const toml = `name = "${workerName}"
+          main = "src/index.ts"
+          compatibility_date = "2026-05-23"
+
+          [vars]
+          APP_NAME = "AEPay"
+          ORDER_EXPIRE_MINUTES = "15"
+          AMOUNT_VARIANCE_CENTS = "30"
+          COLLECT_ACCOUNT = ""
+          COLLECT_QR_IMAGE_URL = ""
+          ALIPAY_NOTIFY_VERIFY_REQUIRED = "true"
+          EPAY_PID = "1000"
+
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "${databaseName}"
+          database_id = "${process.env.CLOUDFLARE_D1_DATABASE_ID}"
+          `;
+          fs.writeFileSync("wrangler.generated.toml", toml.replace(/^ {10}/gm, ""));
+          NODE
+        env:
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          WORKER_NAME: ${{ vars.WORKER_NAME }}
+          D1_DATABASE_NAME: ${{ vars.D1_DATABASE_NAME }}
+
+      - name: Apply D1 migrations
+        run: npx wrangler d1 migrations apply DB --remote --config wrangler.generated.toml
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Deploy Worker
+        run: npx wrangler deploy --config wrangler.generated.toml
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
