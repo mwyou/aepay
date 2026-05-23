@@ -107,7 +107,7 @@ export default {
       const url = new URL(request.url);
       const config = await loadConfig(env);
       if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
-      if (url.pathname === "/" && request.method === "GET") return html(apiHome(config));
+      if (url.pathname === "/" && request.method === "GET") return html(publicHome(config));
       if (url.pathname === "/health" && request.method === "GET") return json({ status: "ok" });
       if (url.pathname === "/admin/setup" && request.method === "GET") return await adminSetupPage(request, config);
       if (url.pathname === "/admin/setup" && request.method === "POST") return await adminSetup(request, env, config);
@@ -1107,23 +1107,101 @@ function statusPill(status: string): string {
   return `<span class="pill ${escapeHtml(status)}">${escapeHtml(status)}</span>`;
 }
 
-function apiHome(config: AppConfig): string {
+function publicHome(config: AppConfig): string {
   return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${escapeHtml(config.appName)}</title>
-<style>body{font:15px/1.6 system-ui;margin:40px;max-width:820px}code{background:#f2f4f7;padding:2px 5px;border-radius:4px}li{margin:8px 0}</style></head>
-<body><h1>${escapeHtml(config.appName)}</h1>
-<p>Cloudflare Workers 版个人支付宝收款确认系统。</p>
-<ul>
-<li><code>POST /api/orders</code> 创建订单</li>
-<li><code>GET /api/orders/:merchant_order_no</code> 查询订单</li>
-<li><code>POST /api/reconcile/manual</code> 人工/账单核销</li>
-<li><code>POST /api/alipay/notify</code> 支付宝开放平台通知入口</li>
-<li><code>GET/POST /submit.php</code> 易支付跳转支付</li>
-<li><code>GET/POST /mapi.php</code> 易支付 JSON 创建订单</li>
-<li><code>GET/POST /api.php?act=order</code> 易支付订单查询</li>
-<li><code>GET /admin</code> 后台入口，首次访问会进入管理员初始化</li>
-</ul></body></html>`;
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(config.appName)}</title>
+  <style>
+    :root { color-scheme: light; --ink:#182230; --muted:#596579; --line:#d8dee8; --paper:#ffffff; --wash:#f5f7fa; --brand:#0f766e; --blue:#1d4ed8; --warn:#9a6700; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; font:15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); background:var(--wash); }
+    header { border-bottom:1px solid var(--line); background:rgba(255,255,255,.92); backdrop-filter:blur(10px); }
+    .nav { max-width:1120px; margin:0 auto; padding:16px 22px; display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    .brand { display:flex; align-items:center; gap:10px; font-weight:800; font-size:18px; }
+    .mark { width:30px; height:30px; display:grid; place-items:center; border-radius:8px; background:#102a43; color:white; font-weight:800; }
+    .admin { min-height:38px; display:inline-flex; align-items:center; justify-content:center; border:1px solid #0f5f59; border-radius:6px; padding:0 14px; color:white; background:var(--brand); text-decoration:none; font-weight:700; }
+    main { max-width:1120px; margin:0 auto; padding:58px 22px 34px; }
+    .hero { display:grid; grid-template-columns:minmax(0, 1.02fr) minmax(360px, .98fr); gap:48px; align-items:center; }
+    h1 { margin:0; max-width:680px; font-size:clamp(34px, 5vw, 62px); line-height:1.05; letter-spacing:0; }
+    .lead { max-width:620px; margin:22px 0 0; color:var(--muted); font-size:18px; }
+    .actions { margin-top:28px; display:flex; flex-wrap:wrap; align-items:center; gap:14px; }
+    .secondary { min-height:38px; display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--line); border-radius:6px; padding:0 14px; color:var(--ink); background:white; text-decoration:none; font-weight:700; }
+    .note { color:var(--muted); font-size:13px; }
+    .preview { border:1px solid var(--line); border-radius:8px; background:var(--paper); box-shadow:0 18px 45px rgba(24,34,48,.10); overflow:hidden; }
+    .preview-head { padding:14px 16px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--line); }
+    .dots { display:flex; gap:6px; }
+    .dot { width:9px; height:9px; border-radius:999px; background:#c7d0dd; }
+    .live { color:var(--brand); font-size:12px; font-weight:800; }
+    .preview-body { padding:18px; display:grid; gap:14px; }
+    .metric-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .metric { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fbfcfe; }
+    .label { color:var(--muted); font-size:12px; }
+    .value { margin-top:4px; font-size:24px; font-weight:800; }
+    .order { border:1px solid var(--line); border-radius:8px; padding:14px; display:grid; gap:10px; }
+    .order-top { display:flex; justify-content:space-between; gap:12px; align-items:center; }
+    .tag { min-height:24px; display:inline-flex; align-items:center; border-radius:999px; padding:0 8px; background:#e8f7f1; color:#0b6b52; font-size:12px; font-weight:800; }
+    .bar { height:8px; border-radius:999px; background:#dbeafe; overflow:hidden; }
+    .bar span { display:block; width:72%; height:100%; background:var(--blue); }
+    .steps { margin-top:44px; display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:16px; }
+    .step { border-top:2px solid var(--line); padding-top:14px; color:var(--muted); }
+    .step strong { display:block; margin-bottom:5px; color:var(--ink); }
+    .compliance { margin-top:34px; border:1px solid #ead79c; border-radius:8px; background:#fff9e8; color:#6f4e00; padding:14px 16px; }
+    @media (max-width: 860px) {
+      main { padding-top:34px; }
+      .hero { grid-template-columns:1fr; gap:28px; }
+      .preview { max-width:560px; }
+      .steps { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="nav">
+      <div class="brand"><span class="mark">A</span><span>${escapeHtml(config.appName)}</span></div>
+      <a class="admin" href="/admin">进入后台</a>
+    </div>
+  </header>
+  <main>
+    <section class="hero">
+      <div>
+        <h1>个人支付宝收款确认，更清楚地对账和回调。</h1>
+        <p class="lead">${escapeHtml(config.appName)} 部署在 Cloudflare Workers 和 D1 上，用于创建待支付订单、匹配到账记录，并把确认结果通知给你的业务系统。</p>
+        <div class="actions">
+          <a class="admin" href="/admin">管理订单</a>
+          <a class="secondary" href="/health">服务状态</a>
+          <span class="note">首次进入后台会创建管理员账号</span>
+        </div>
+      </div>
+      <div class="preview" aria-hidden="true">
+        <div class="preview-head">
+          <div class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+          <span class="live">D1 ONLINE</span>
+        </div>
+        <div class="preview-body">
+          <div class="metric-row">
+            <div class="metric"><div class="label">待确认</div><div class="value">12</div></div>
+            <div class="metric"><div class="label">今日到账</div><div class="value">¥286.40</div></div>
+          </div>
+          <div class="order">
+            <div class="order-top"><strong>ORDER-20260523</strong><span class="tag">已匹配</span></div>
+            <div class="label">应付金额 ¥9.91 · 支付宝交易号 2026******001</div>
+            <div class="bar"><span></span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="steps">
+      <div class="step"><strong>创建订单</strong>生成带尾数区分的应付金额，降低同额订单碰撞。</div>
+      <div class="step"><strong>确认到账</strong>接收支付宝通知，或在后台手动录入账单核销。</div>
+      <div class="step"><strong>发送回调</strong>订单匹配成功后，向业务系统发送签名回调。</div>
+    </section>
+    <div class="compliance">合规提醒：本系统只做收款确认和对账记录，不提供支付清算，不规避平台风控，也不适用于代收、跑分等违规场景。</div>
+  </main>
+</body>
+</html>`;
 }
 
 async function hmacSha256(secret: string, body: string): Promise<string> {
