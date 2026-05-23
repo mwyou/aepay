@@ -11,6 +11,9 @@ COLLECT_QR_IMAGE_URL = ""
 ALIPAY_NOTIFY_VERIFY_REQUIRED = "true"
 EPAY_PID = "1000"
 
+[triggers]
+crons = ["*/1 * * * *"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "aepay"

@@ -9,6 +9,8 @@ export interface Env {
   MERCHANT_API_KEY: string;
   EPAY_PID: string;
   EPAY_KEY: string;
+  ALIPAY_APP_ID: string;
+  ALIPAY_PRIVATE_KEY_PEM: string;
   ALIPAY_PUBLIC_KEY_PEM: string;
   ALIPAY_NOTIFY_VERIFY_REQUIRED: string;
 }
@@ -60,6 +62,19 @@ interface CallbackLogRow {
   updated_at: string;
 }
 
+interface PollingRunRow {
+  id: number;
+  source: string;
+  status: string;
+  started_at: string;
+  finished_at: string | null;
+  window_start: string;
+  window_end: string;
+  fetched_count: number;
+  matched_count: number;
+  error: string;
+}
+
 interface CreateOrderBody {
   merchant_order_no: string;
   amount: string;
@@ -84,6 +99,12 @@ interface AppConfig {
   amountVarianceCents: string;
   collectAccount: string;
   collectQrImageUrl: string;
+  alipayPollEnabled: string;
+  alipayPollMethod: string;
+  alipayPollWindowMinutes: string;
+  alipayGatewayUrl: string;
+  alipayAppId: string;
+  alipayPrivateKeyPem: string;
   alipayNotifyVerifyRequired: string;
   alipayPublicKeyPem: string;
   callbackSecret: string;
@@ -117,6 +138,9 @@ export default {
       if (url.pathname === "/admin" && request.method === "GET") return await requireAdmin(request, env, config, () => adminPage(env, config));
       if (url.pathname === "/api/admin/settings" && request.method === "POST") {
         return await requireAdmin(request, env, config, () => updateSettings(request, env, config));
+      }
+      if (url.pathname === "/api/admin/polling/run" && request.method === "POST") {
+        return await requireAdmin(request, env, config, () => runPollingNow(env, config));
       }
       if (url.pathname === "/submit.php" && ["GET", "POST"].includes(request.method)) {
         return await epaySubmit(request, env, config);
@@ -152,6 +176,10 @@ export default {
       return json({ detail: message }, 500);
     }
   },
+  async scheduled(_: ScheduledController, env: Env): Promise<void> {
+    const config = await loadConfig(env);
+    await runAlipayPolling(env, config);
+  },
 };
 
 class HttpError extends Error {
@@ -172,6 +200,12 @@ async function loadConfig(env: Env): Promise<AppConfig> {
     amountVarianceCents: settings.get("amount_variance_cents") || env.AMOUNT_VARIANCE_CENTS || "30",
     collectAccount: settings.get("collect_account") || env.COLLECT_ACCOUNT || "",
     collectQrImageUrl: settings.get("collect_qr_image_url") || env.COLLECT_QR_IMAGE_URL || "",
+    alipayPollEnabled: settings.get("alipay_poll_enabled") || "false",
+    alipayPollMethod: settings.get("alipay_poll_method") || "",
+    alipayPollWindowMinutes: settings.get("alipay_poll_window_minutes") || "10",
+    alipayGatewayUrl: settings.get("alipay_gateway_url") || "https://openapi.alipay.com/gateway.do",
+    alipayAppId: settings.get("alipay_app_id") || env.ALIPAY_APP_ID || "",
+    alipayPrivateKeyPem: settings.get("alipay_private_key_pem") || env.ALIPAY_PRIVATE_KEY_PEM || "",
     alipayNotifyVerifyRequired:
       settings.get("alipay_notify_verify_required") || env.ALIPAY_NOTIFY_VERIFY_REQUIRED || "true",
     alipayPublicKeyPem: settings.get("alipay_public_key_pem") || env.ALIPAY_PUBLIC_KEY_PEM || "",
@@ -193,6 +227,10 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
     amount_variance_cents: stringForm(form, "amount_variance_cents"),
     collect_account: stringForm(form, "collect_account"),
     collect_qr_image_url: stringForm(form, "collect_qr_image_url"),
+    alipay_poll_enabled: stringForm(form, "alipay_poll_enabled") === "true" ? "true" : "false",
+    alipay_poll_method: stringForm(form, "alipay_poll_method"),
+    alipay_poll_window_minutes: stringForm(form, "alipay_poll_window_minutes"),
+    alipay_gateway_url: stringForm(form, "alipay_gateway_url"),
     alipay_notify_verify_required: stringForm(form, "alipay_notify_verify_required") === "true" ? "true" : "false",
     epay_pid: stringForm(form, "epay_pid"),
   };
@@ -200,13 +238,22 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
   assertPositiveInteger(plain.order_expire_minutes, "order_expire_minutes");
   assertPositiveInteger(plain.amount_variance_cents, "amount_variance_cents");
   if (plain.collect_qr_image_url) assertUrl(plain.collect_qr_image_url, "collect_qr_image_url");
+  assertPositiveInteger(plain.alipay_poll_window_minutes, "alipay_poll_window_minutes");
+  if (plain.alipay_gateway_url) assertUrl(plain.alipay_gateway_url, "alipay_gateway_url");
   assertText(plain.epay_pid, "epay_pid");
 
   for (const [key, value] of Object.entries(plain)) {
     await upsertSetting(env, key, value, false, now);
   }
 
-  const secrets = ["callback_secret", "merchant_api_key", "epay_key", "alipay_public_key_pem"];
+  const secrets = [
+    "callback_secret",
+    "merchant_api_key",
+    "epay_key",
+    "alipay_app_id",
+    "alipay_private_key_pem",
+    "alipay_public_key_pem",
+  ];
   for (const key of secrets) {
     const value = stringForm(form, key);
     if (value.trim() !== "") await upsertSetting(env, key, value, true, now);
@@ -428,6 +475,247 @@ async function alipayNotify(request: Request, env: Env, config: AppConfig): Prom
   return text("success");
 }
 
+async function runPollingNow(env: Env, config: AppConfig): Promise<Response> {
+  const result = await runAlipayPolling(env, config, true);
+  return json(result);
+}
+
+async function runAlipayPolling(
+  env: Env,
+  config: AppConfig,
+  force = false,
+): Promise<{ status: string; fetched_count: number; matched_count: number; error?: string }> {
+  const startedAt = new Date();
+  const windowMinutes = numberEnv(config.alipayPollWindowMinutes, 10);
+  const windowEnd = startedAt;
+  const windowStart = new Date(windowEnd.getTime() - windowMinutes * 60_000);
+  const runId = await createPollingRun(env, "running", startedAt, windowStart, windowEnd);
+
+  try {
+    if (config.alipayPollEnabled !== "true" && !force) {
+      await finishPollingRun(env, runId, "skipped", 0, 0, "polling disabled");
+      return { status: "skipped", fetched_count: 0, matched_count: 0, error: "polling disabled" };
+    }
+    if (!config.alipayAppId || !config.alipayPrivateKeyPem || !config.alipayPollMethod) {
+      throw new Error("支付宝查账未配置完整：APP_ID、应用私钥和查账接口名都必填");
+    }
+
+    const rows = await queryAlipayTransactions(config, windowStart, windowEnd);
+    let matchedCount = 0;
+    for (const row of rows) {
+      const result = await ingestPolledTransaction(env, config, row);
+      if (result.order) matchedCount += 1;
+    }
+    await finishPollingRun(env, runId, "success", rows.length, matchedCount, "");
+    return { status: "success", fetched_count: rows.length, matched_count: matchedCount };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "polling failed";
+    await finishPollingRun(env, runId, "failed", 0, 0, message);
+    return { status: "failed", fetched_count: 0, matched_count: 0, error: message };
+  }
+}
+
+async function createPollingRun(
+  env: Env,
+  status: string,
+  startedAt: Date,
+  windowStart: Date,
+  windowEnd: Date,
+): Promise<number> {
+  const inserted = await env.DB.prepare(
+    `INSERT INTO polling_runs (source, status, started_at, window_start, window_end)
+     VALUES ('alipay', ?, ?, ?, ?) RETURNING id`,
+  )
+    .bind(status, startedAt.toISOString(), windowStart.toISOString(), windowEnd.toISOString())
+    .first<{ id: number }>();
+  return inserted?.id ?? 0;
+}
+
+async function finishPollingRun(
+  env: Env,
+  id: number,
+  status: string,
+  fetchedCount: number,
+  matchedCount: number,
+  error: string,
+): Promise<void> {
+  if (!id) return;
+  await env.DB.prepare(
+    `UPDATE polling_runs
+     SET status = ?, finished_at = ?, fetched_count = ?, matched_count = ?, error = ?
+     WHERE id = ?`,
+  )
+    .bind(status, new Date().toISOString(), fetchedCount, matchedCount, error.slice(0, 1000), id)
+    .run();
+}
+
+interface PolledTransaction {
+  provider_trade_no: string;
+  amount: string;
+  paid_at: string;
+  payer: string;
+  collect_account: string;
+  raw_payload: unknown;
+}
+
+async function queryAlipayTransactions(config: AppConfig, start: Date, end: Date): Promise<PolledTransaction[]> {
+  const payload = defaultAlipayPollPayload(config.alipayPollMethod, start, end);
+  const response = await alipayOpenApiRequest(config, config.alipayPollMethod, payload);
+  return extractPolledTransactions(response);
+}
+
+function defaultAlipayPollPayload(method: string, start: Date, end: Date): Record<string, unknown> {
+  if (method === "alipay.user.accountreport.get") {
+    return {
+      fields:
+        "create_time,type,business_type,balance,in_amount,out_amount,alipay_order_no,merchant_order_no,self_user_id,opt_user_id,memo",
+      start_time: formatAlipayTime(start),
+      end_time: formatAlipayTime(end),
+      page_no: 1,
+      page_size: 100,
+    };
+  }
+  return {
+    start_time: formatAlipayTime(start),
+    end_time: formatAlipayTime(end),
+    page_no: 1,
+    page_size: 100,
+  };
+}
+
+async function alipayOpenApiRequest(
+  config: AppConfig,
+  method: string,
+  bizContent: Record<string, unknown>,
+): Promise<unknown> {
+  const params: Record<string, string> = {
+    app_id: config.alipayAppId,
+    method,
+    charset: "utf-8",
+    sign_type: "RSA2",
+    timestamp: formatAlipayTime(new Date()),
+    version: "1.0",
+    biz_content: JSON.stringify(bizContent),
+  };
+  params.sign = await rsa2Sign(config.alipayPrivateKeyPem, alipaySignContent(params));
+
+  const response = await fetch(config.alipayGatewayUrl, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded;charset=utf-8" },
+    body: new URLSearchParams(params),
+  });
+  const textBody = await response.text();
+  if (!response.ok) throw new Error(`支付宝接口请求失败：HTTP ${response.status}`);
+  let payload: unknown;
+  try {
+    payload = JSON.parse(textBody) as unknown;
+  } catch {
+    throw new Error("支付宝接口返回不是 JSON");
+  }
+  const error = alipayResponseError(payload);
+  if (error) throw new Error(error);
+  return payload;
+}
+
+function alipayResponseError(value: unknown): string {
+  if (!isRecord(value)) return "";
+  for (const nested of Object.values(value)) {
+    if (!isRecord(nested)) continue;
+    const code = typeof nested.code === "string" ? nested.code : "";
+    if (code && code !== "10000") {
+      const message = [nested.msg, nested.sub_code, nested.sub_msg]
+        .filter((item): item is string => typeof item === "string" && item !== "")
+        .join(" / ");
+      return message || `支付宝接口返回错误码 ${code}`;
+    }
+  }
+  return "";
+}
+
+function extractPolledTransactions(response: unknown): PolledTransaction[] {
+  const rows = findTransactionRows(response);
+  return rows.flatMap((row) => {
+    const tradeNo = stringField(row, ["alipay_order_no", "trade_no", "provider_trade_no", "transaction_id", "order_no"]);
+    const amount = stringField(row, ["in_amount", "amount", "total_amount", "pay_amount"]);
+    const paidAt = stringField(row, ["create_time", "paid_at", "pay_time", "gmt_payment"]);
+    if (!tradeNo || !/^\d+(\.\d{1,2})?$/.test(amount) || moneyToCents(amount) <= 0 || !paidAt) return [];
+    return [
+      {
+        provider_trade_no: tradeNo,
+        amount: centsToMoney(moneyToCents(amount)),
+        paid_at: normalizeDate(paidAt.includes("T") ? paidAt : paidAt.replace(" ", "T") + "+08:00", "paid_at"),
+        payer: stringField(row, ["opt_user_id", "buyer_user_id", "buyer_logon_id", "payer"]),
+        collect_account: stringField(row, ["self_user_id", "seller_id", "collect_account"]),
+        raw_payload: row,
+      },
+    ];
+  });
+}
+
+function findTransactionRows(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) {
+    return value.filter(isRecord);
+  }
+  if (!isRecord(value)) return [];
+  for (const key of ["account_report_list", "trade_list", "detail_list", "bill_list", "records", "items", "list"]) {
+    const nested = value[key];
+    if (Array.isArray(nested)) return nested.filter(isRecord);
+  }
+  for (const nested of Object.values(value)) {
+    const rows = findTransactionRows(nested);
+    if (rows.length > 0) return rows;
+  }
+  return [];
+}
+
+async function ingestPolledTransaction(
+  env: Env,
+  config: AppConfig,
+  row: PolledTransaction,
+): Promise<{ event: PaymentEventRow; order: OrderRow | null }> {
+  const existingEvent = await env.DB.prepare(
+    "SELECT id FROM payment_events WHERE provider = 'alipay' AND provider_trade_no = ?",
+  )
+    .bind(row.provider_trade_no)
+    .first<{ id: number }>();
+
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO alipay_transactions
+      (source, provider_trade_no, amount, paid_at, payer, collect_account, raw_payload, created_at)
+     VALUES ('poll', ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      row.provider_trade_no,
+      row.amount,
+      row.paid_at,
+      row.payer,
+      row.collect_account,
+      JSON.stringify(row.raw_payload),
+      new Date().toISOString(),
+    )
+    .run();
+
+  const result = await recordPaymentEvent(
+    env,
+    config,
+    {
+      alipay_trade_no: row.provider_trade_no,
+      amount: row.amount,
+      paid_at: row.paid_at,
+      payer: row.payer,
+      collect_account: row.collect_account,
+    },
+    row.raw_payload,
+  );
+  if (result.order && !existingEvent) await dispatchCallback(env, config, result.order);
+  if (result.order) {
+    await env.DB.prepare("UPDATE alipay_transactions SET matched_order_id = ? WHERE provider_trade_no = ?")
+      .bind(result.order.id, row.provider_trade_no)
+      .run();
+  }
+  return result;
+}
+
 async function recordPaymentEvent(
   env: Env,
   config: AppConfig,
@@ -581,12 +869,13 @@ async function buildCallback(config: AppConfig, order: OrderRow): Promise<{ body
 }
 
 async function adminPage(env: Env, config: AppConfig): Promise<Response> {
-  const [orders, events, callbacks] = await Promise.all([
+  const [orders, events, callbacks, pollingRuns] = await Promise.all([
     env.DB.prepare("SELECT * FROM orders ORDER BY id DESC LIMIT 50").all<OrderRow>(),
     env.DB.prepare("SELECT * FROM payment_events ORDER BY id DESC LIMIT 30").all<PaymentEventRow>(),
     env.DB.prepare("SELECT * FROM callback_logs ORDER BY id DESC LIMIT 30").all<CallbackLogRow>(),
+    env.DB.prepare("SELECT * FROM polling_runs ORDER BY id DESC LIMIT 20").all<PollingRunRow>(),
   ]);
-  return html(renderAdmin(config, orders.results, events.results, callbacks.results));
+  return html(renderAdmin(config, orders.results, events.results, callbacks.results, pollingRuns.results));
 }
 
 async function adminOrders(env: Env): Promise<Response> {
@@ -863,6 +1152,7 @@ function renderAdmin(
   orders: OrderRow[],
   events: PaymentEventRow[],
   callbacks: CallbackLogRow[],
+  pollingRuns: PollingRunRow[],
 ): string {
   return `<!doctype html>
 <html lang="zh-CN">
@@ -912,15 +1202,23 @@ function renderAdmin(
       ${settingsForm(config)}
     </section>
     <section>
-      <h2>手动核销</h2>
+      <h2>调试核销</h2>
       <form method="post" action="/api/reconcile/manual" onsubmit="return submitReconcile(event)">
         <label>支付宝交易号<input name="alipay_trade_no" required></label>
         <label>金额<input name="amount" required placeholder="9.91"></label>
         <label>支付时间<input name="paid_at" required></label>
         <label>付款方<input name="payer"></label>
-        <button type="submit">确认到账</button>
+        <button type="submit">模拟到账</button>
       </form>
-      <div class="note">支付时间请用 ISO 格式，例如 2026-05-23T14:00:00+08:00。</div>
+      <div class="note">仅用于开发测试自动匹配和回调链路；正式流程由自动查账完成。</div>
+    </section>
+    <section>
+      <h2>自动查账</h2>
+      <form method="post" action="/api/admin/polling/run" onsubmit="return submitPolling(event)" style="grid-template-columns:1fr auto;">
+        <div class="note" style="padding:0;">Cron 每分钟执行一次；保存支付宝查账配置后，可在这里立即测试一次。</div>
+        <button type="submit">立即查账</button>
+      </form>
+      <div class="scroll">${pollingRunsTable(pollingRuns)}</div>
     </section>
     <section>
       <h2>订单</h2>
@@ -950,6 +1248,13 @@ function renderAdmin(
       if (res.ok) location.reload();
       return false;
     }
+    async function submitPolling(event) {
+      event.preventDefault();
+      const res = await fetch('/api/admin/polling/run', { method: 'POST' });
+      alert(await res.text());
+      if (res.ok) location.reload();
+      return false;
+    }
   </script>
 </body>
 </html>`;
@@ -963,6 +1268,15 @@ function settingsForm(config: AppConfig): string {
     <label>收款账号标识<input name="collect_account" value="${escapeAttr(config.collectAccount)}"></label>
     <label>收款码图片 URL<input name="collect_qr_image_url" value="${escapeAttr(config.collectQrImageUrl)}"></label>
     <label>易支付 PID<input name="epay_pid" value="${escapeAttr(config.epayPid)}" required></label>
+    <label>自动查账
+      <select name="alipay_poll_enabled">
+        <option value="false"${config.alipayPollEnabled !== "true" ? " selected" : ""}>关闭</option>
+        <option value="true"${config.alipayPollEnabled === "true" ? " selected" : ""}>开启</option>
+      </select>
+    </label>
+    <label>查账接口名<input name="alipay_poll_method" value="${escapeAttr(config.alipayPollMethod)}" placeholder="alipay.user.accountreport.get"></label>
+    <label>查账回看分钟<input name="alipay_poll_window_minutes" value="${escapeAttr(config.alipayPollWindowMinutes)}" inputmode="numeric" required></label>
+    <label class="wide">支付宝网关<input name="alipay_gateway_url" value="${escapeAttr(config.alipayGatewayUrl)}" required></label>
     <label>支付宝通知验签
       <select name="alipay_notify_verify_required">
         <option value="true"${config.alipayNotifyVerifyRequired === "true" ? " selected" : ""}>开启</option>
@@ -972,8 +1286,10 @@ function settingsForm(config: AppConfig): string {
     <label>商户 API Key<input name="merchant_api_key" type="password" placeholder="${secretPlaceholder(config.merchantApiKey)}"></label>
     <label>易支付 Key<input name="epay_key" type="password" placeholder="${secretPlaceholder(config.epayKey)}"></label>
     <label>回调 HMAC 密钥<input name="callback_secret" type="password" placeholder="${secretPlaceholder(config.callbackSecret)}"></label>
+    <label>支付宝 APP_ID<input name="alipay_app_id" type="password" placeholder="${secretPlaceholder(config.alipayAppId)}"></label>
     <label>管理员账号<input name="admin_username" value="${escapeAttr(config.adminUsername)}" autocomplete="username"></label>
     <label>管理员新密码<input name="admin_password" type="password" placeholder="${secretPlaceholder(config.adminPasswordHash)}" autocomplete="new-password"></label>
+    <label class="wide">支付宝应用私钥 PEM<textarea name="alipay_private_key_pem" placeholder="${secretPlaceholder(config.alipayPrivateKeyPem)}"></textarea></label>
     <label class="wide">支付宝公钥 PEM<textarea name="alipay_public_key_pem" placeholder="${secretPlaceholder(config.alipayPublicKeyPem)}"></textarea></label>
     <button type="submit">保存设置</button>
     <div class="note wide">密钥类字段留空表示不修改；页面不会回显明文。</div>
@@ -1092,6 +1408,20 @@ function callbacksTable(rows: CallbackLogRow[]): string {
   );
 }
 
+function pollingRunsTable(rows: PollingRunRow[]): string {
+  return table(
+    ["状态", "查账窗口", "获取", "匹配", "错误", "时间"],
+    rows.map((row) => [
+      statusPill(row.status),
+      `${shortDate(row.window_start)} - ${shortDate(row.window_end)}`,
+      String(row.fetched_count),
+      String(row.matched_count),
+      row.error ? escapeHtml(row.error) : "-",
+      shortDate(row.started_at),
+    ]),
+  );
+}
+
 function table(headers: string[], rows: string[][]): string {
   const head = headers.map((header) => `<th>${escapeHtml(header)}</th>`).join("");
   const body =
@@ -1167,8 +1497,8 @@ function publicHome(config: AppConfig): string {
   <main>
     <section class="hero">
       <div>
-        <h1>个人支付宝收款确认，更清楚地对账和回调。</h1>
-        <p class="lead">${escapeHtml(config.appName)} 部署在 Cloudflare Workers 和 D1 上，用于创建待支付订单、匹配到账记录，并把确认结果通知给你的业务系统。</p>
+        <h1>经营码收款确认，更清楚地对账和回调。</h1>
+        <p class="lead">${escapeHtml(config.appName)} 部署在 Cloudflare Workers 和 D1 上，用于创建待支付订单、轮询支付宝账单流水，并把确认结果通知给你的业务系统。</p>
         <div class="actions">
           <a class="admin" href="/admin">管理订单</a>
           <a class="secondary" href="/health">服务状态</a>
@@ -1195,7 +1525,7 @@ function publicHome(config: AppConfig): string {
     </section>
     <section class="steps">
       <div class="step"><strong>创建订单</strong>生成带尾数区分的应付金额，降低同额订单碰撞。</div>
-      <div class="step"><strong>确认到账</strong>接收支付宝通知，或在后台手动录入账单核销。</div>
+      <div class="step"><strong>确认到账</strong>定时查询支付宝开放平台账单流水，自动匹配待支付订单。</div>
       <div class="step"><strong>发送回调</strong>订单匹配成功后，向业务系统发送签名回调。</div>
     </section>
     <div class="compliance">合规提醒：本系统只做收款确认和对账记录，不提供支付清算，不规避平台风控，也不适用于代收、跑分等违规场景。</div>
@@ -1214,6 +1544,18 @@ async function hmacSha256(secret: string, body: string): Promise<string> {
   );
   const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
   return `sha256=${hex(signature)}`;
+}
+
+async function rsa2Sign(privateKeyPem: string, content: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToPrivateKeyArrayBuffer(privateKeyPem),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(content));
+  return arrayBufferToBase64(signature);
 }
 
 async function sha256Hex(value: string): Promise<string> {
@@ -1256,6 +1598,14 @@ function pemToArrayBuffer(pem: string): ArrayBuffer {
   return base64ToArrayBuffer(normalized);
 }
 
+function pemToPrivateKeyArrayBuffer(pem: string): ArrayBuffer {
+  const normalized = pem
+    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/\s+/g, "");
+  return base64ToArrayBuffer(normalized);
+}
+
 function base64ToArrayBuffer(value: string): ArrayBuffer {
   const binary = atob(value);
   const bytes = new Uint8Array(binary.length);
@@ -1263,8 +1613,42 @@ function base64ToArrayBuffer(value: string): ArrayBuffer {
   return bytes.buffer;
 }
 
+function arrayBufferToBase64(value: ArrayBuffer): string {
+  let binary = "";
+  for (const byte of new Uint8Array(value)) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 function hex(buffer: ArrayBuffer): string {
   return [...new Uint8Array(buffer)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function formatAlipayTime(date: Date): string {
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day} ${value.hour}:${value.minute}:${value.second}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringField(row: Record<string, unknown>, names: string[]): string {
+  for (const name of names) {
+    const value = row[name];
+    if (typeof value === "string" && value.trim() !== "") return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return "";
 }
 
 async function readJson<T>(request: Request): Promise<T> {

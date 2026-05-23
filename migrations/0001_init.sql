@@ -40,6 +40,37 @@ CREATE TABLE IF NOT EXISTS payment_events (
 
 CREATE INDEX IF NOT EXISTS idx_payment_events_matched_order_id ON payment_events(matched_order_id);
 
+CREATE TABLE IF NOT EXISTS alipay_transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL DEFAULT 'poll',
+  provider_trade_no TEXT NOT NULL UNIQUE,
+  amount TEXT NOT NULL,
+  paid_at TEXT NOT NULL,
+  payer TEXT NOT NULL DEFAULT '',
+  collect_account TEXT NOT NULL DEFAULT '',
+  raw_payload TEXT NOT NULL DEFAULT '',
+  matched_order_id INTEGER,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_alipay_transactions_paid_at ON alipay_transactions(paid_at);
+CREATE INDEX IF NOT EXISTS idx_alipay_transactions_matched_order_id ON alipay_transactions(matched_order_id);
+
+CREATE TABLE IF NOT EXISTS polling_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL DEFAULT 'alipay',
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  window_start TEXT NOT NULL,
+  window_end TEXT NOT NULL,
+  fetched_count INTEGER NOT NULL DEFAULT 0,
+  matched_count INTEGER NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_polling_runs_started_at ON polling_runs(started_at);
+
 CREATE TABLE IF NOT EXISTS callback_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   order_id INTEGER NOT NULL,
@@ -68,6 +99,12 @@ INSERT OR IGNORE INTO system_settings (key, value, is_secret, updated_at) VALUES
   ('amount_variance_cents', '30', 0, datetime('now')),
   ('collect_account', '', 0, datetime('now')),
   ('collect_qr_image_url', '', 0, datetime('now')),
+  ('alipay_poll_enabled', 'false', 0, datetime('now')),
+  ('alipay_poll_method', '', 0, datetime('now')),
+  ('alipay_poll_window_minutes', '10', 0, datetime('now')),
+  ('alipay_gateway_url', 'https://openapi.alipay.com/gateway.do', 0, datetime('now')),
+  ('alipay_app_id', '', 1, datetime('now')),
+  ('alipay_private_key_pem', '', 1, datetime('now')),
   ('alipay_notify_verify_required', 'true', 0, datetime('now')),
   ('alipay_public_key_pem', '', 1, datetime('now')),
   ('callback_secret', '', 1, datetime('now')),
