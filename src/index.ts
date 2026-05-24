@@ -171,6 +171,9 @@ export default {
       if (url.pathname === "/api/admin/settings" && request.method === "POST") {
         return await requireAdmin(request, env, config, () => updateSettings(request, env, config));
       }
+      if (url.pathname === "/api/admin/alipay-key-check" && request.method === "POST") {
+        return await requireAdmin(request, env, config, () => alipayKeyCheck(config));
+      }
       if (url.pathname === "/api/admin/payment-qr-assets" && request.method === "POST") {
         return await requireAdmin(request, env, config, () => updatePaymentQrAssets(request, env, config));
       }
@@ -530,6 +533,10 @@ function normalizePublicKeyPem(value: string): string {
   return `-----BEGIN PUBLIC KEY-----\n${compact.match(/.{1,64}/g)?.join("\n") || compact}\n-----END PUBLIC KEY-----`;
 }
 
+function looksLikePrivateKeyPem(value: string): boolean {
+  return value.includes("-----BEGIN PRIVATE KEY-----") || value.includes("-----BEGIN RSA PRIVATE KEY-----");
+}
+
 async function createOrder(request: Request, env: Env, config: AppConfig): Promise<Response> {
   const body = await readJson<CreateOrderBody>(request);
   const order = await createOrderRecord(env, config, body);
@@ -775,17 +782,58 @@ async function runAlipayPolling(
     await finishPollingRun(env, runId, "success", rows.length, matchedCount, "");
     return { status: "success", fetched_count: rows.length, matched_count: matchedCount };
   } catch (error) {
-    const message = friendlyPollingError(error instanceof Error ? error.message : "polling failed");
+    const message = await friendlyPollingError(error instanceof Error ? error.message : "polling failed", config);
     await finishPollingRun(env, runId, "failed", 0, 0, message);
     return { status: "failed", fetched_count: 0, matched_count: 0, error: message };
   }
 }
 
-function friendlyPollingError(message: string): string {
-  if (message.includes("isv.invalid-signature")) {
-    return "支付宝验签失败：请把 AEPay 已保存的应用公钥复制到支付宝开放平台，并确认当前应用私钥已保存";
+async function friendlyPollingError(message: string, config?: AppConfig): Promise<string> {
+  if (message.toLowerCase().includes("invalid-signature")) {
+    return await diagnoseAlipaySignatureFailure(config);
   }
   return message.split("&amp;")[0].slice(0, 300);
+}
+
+async function diagnoseAlipaySignatureFailure(config?: AppConfig): Promise<string> {
+  if (!config) {
+    return "支付宝接口验签失败：请检查当前应用私钥和支付宝开放平台中的应用公钥是否匹配。";
+  }
+  const result = await validateAlipayAppKeyPair(config);
+  if (!result.ok) return `支付宝接口验签失败：${result.message}`;
+  return "支付宝接口验签失败：本地应用密钥对已校验通过，请确认支付宝开放平台里保存的是当前应用公钥，并检查 app_id 是否对应当前应用。";
+}
+
+async function validateAlipayAppKeyPair(config: AppConfig): Promise<{ ok: boolean; message: string }> {
+  const privateKeyPem = config.alipayPrivateKeyPem.trim();
+  const appPublicKeyText = config.alipayAppPublicKeyText.trim();
+  if (!privateKeyPem || !appPublicKeyText) {
+    return { ok: false, message: "请先保存应用私钥和应用公钥，再把应用公钥同步到支付宝开放平台" };
+  }
+  try {
+    const probe = "aepay-alipay-key-check";
+    const signature = await rsa2Sign(privateKeyPem, probe);
+    const verified = await verifyAlipayRsa2({ probe, sign: signature }, normalizePublicKeyPem(appPublicKeyText));
+    if (!verified) {
+      return { ok: false, message: "当前应用私钥和应用公钥不是同一对，请重新生成后保存，再把新的应用公钥同步到支付宝开放平台" };
+    }
+    return { ok: true, message: "本地应用密钥对校验通过" };
+  } catch {
+    return { ok: false, message: "应用私钥或应用公钥格式不正确，请重新生成后再保存" };
+  }
+}
+
+async function alipayKeyCheck(config: AppConfig): Promise<Response> {
+  const result = await validateAlipayAppKeyPair(config);
+  return json({
+    status: result.ok ? "success" : "failed",
+    message: result.ok
+      ? "本地应用密钥对校验通过；如果查账仍报验签失败，请确认支付宝开放平台里的应用公钥已经更新，并检查 app_id 是否对应当前应用。"
+      : `本地应用密钥对校验失败：${result.message}`,
+    app_id_present: Boolean(config.alipayAppId.trim()),
+    private_key_present: Boolean(config.alipayPrivateKeyPem.trim()),
+    app_public_key_present: Boolean(config.alipayAppPublicKeyText.trim()),
+  });
 }
 
 async function createPollingRun(
@@ -862,6 +910,7 @@ async function alipayOpenApiRequest(
   const params: Record<string, string> = {
     app_id: config.alipayAppId,
     method,
+    format: "JSON",
     charset: "utf-8",
     sign_type: "RSA2",
     timestamp: formatAlipayTime(new Date(), config.timeZone),
@@ -2500,6 +2549,24 @@ function renderAdmin(
         window.prompt('浏览器拦截了自动复制，请手动复制：', output.value);
       }
     }
+    async function checkAlipayKeyPair() {
+      const target = 'alipay-key-check-status';
+      try {
+        showStatus(target, '正在校验本地应用密钥对...');
+        const res = await fetch('/api/admin/alipay-key-check', { method: 'POST' });
+        const text = await res.text();
+        let data = null;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = null;
+        }
+        const message = data && typeof data.message === 'string' ? data.message : text;
+        showStatus(target, message, !res.ok || !data || data.status !== 'success');
+      } catch (error) {
+        showStatus(target, error instanceof Error ? error.message : '校验失败', true);
+      }
+    }
     const paymentPreviewThemes = {
       minimal: { colorScheme:'light', bg:'#f6f8fb', bg2:'#eef2f8', panel:'#ffffff', panelSoft:'#f8fafc', text:'#1f2937', muted:'#667085', line:'#dfe5ee', brand:'#102a43', brand2:'#3b82f6', accent:'#2563eb', qrBg:'#ffffff', radius:'8px', shadow:'0 12px 40px rgba(15,23,42,.08)' },
       alipay: { colorScheme:'light', bg:'#eef6ff', bg2:'#dfeeff', panel:'#ffffff', panelSoft:'#f7fbff', text:'#132238', muted:'#5b6b80', line:'#d2e3f3', brand:'#1677ff', brand2:'#4f8dff', accent:'#1677ff', qrBg:'#f7fbff', radius:'18px', shadow:'0 22px 56px rgba(22,119,255,.18)' },
@@ -2684,7 +2751,12 @@ function settingsForm(config: AppConfig): string {
     <label>回调 HMAC 密钥，仅 JSON 回调用<input name="callback_secret" type="password" placeholder="${secretPlaceholder(config.callbackSecret)}"></label>
     <label>商户 API Key，仅直连 API 用<input name="merchant_api_key" type="password" placeholder="${secretPlaceholder(config.merchantApiKey)}"></label>
     <label>管理员账号<input name="admin_username" value="${escapeAttr(config.adminUsername)}" autocomplete="username"></label>
-    <label>管理员新密码<input name="admin_password" type="password" placeholder="${secretPlaceholder(config.adminPasswordHash)}" autocomplete="new-password"></label>
+    <label>管理员新密码
+      <div class="password-field">
+        <input name="admin_password" type="password" placeholder="${secretPlaceholder(config.adminPasswordHash)}" autocomplete="new-password">
+        <button type="button" class="toggle-password" onclick="togglePasswordField(this)">显示</button>
+      </div>
+    </label>
     <div class="wide" style="display:flex; flex-wrap:wrap; gap:10px;">
       <button type="button" onclick="fillSecret('callback_secret')">生成回调 HMAC 密钥</button>
       <button type="button" onclick="fillSecret('merchant_api_key')">生成商户 API Key</button>
@@ -2757,8 +2829,10 @@ function settingsForm(config: AppConfig): string {
     <div class="wide" style="display:flex; flex-wrap:wrap; gap:10px;">
       <button id="generate-alipay-key-button" type="button" onclick="generateAlipayKeyPair()">生成支付宝应用密钥对</button>
       <button type="button" onclick="copyAlipayPublicKey()">复制支付宝后台专用公钥</button>
+      <button type="button" onclick="checkAlipayKeyPair()">校验应用密钥对</button>
     </div>
     <div id="alipay-key-status" class="action-status wide"></div>
+    <div id="alipay-key-check-status" class="action-status wide"></div>
     <div class="note wide" style="padding:0;">当前应用私钥：<span id="alipay-app-private-key-preview">${secretPreview(alipayPrivateKeyText(config.alipayPrivateKeyPem))}</span></div>
     <input name="alipay_private_key_pem" type="hidden" value="">
     <div class="note wide" style="padding:0;">当前应用公钥：<span id="alipay-app-public-key-preview">${secretPreview(config.alipayAppPublicKeyText)}</span> ${config.alipayAppPublicKeyText ? `<button type="button" onclick="copyAlipayPublicKey()">复制应用公钥</button>` : ""}</div>
@@ -2953,6 +3027,25 @@ function loginPage(config: AppConfig, hasError: boolean): string {
       color:var(--text);
       background:#fff;
     }
+    .password-field {
+      display:grid;
+      grid-template-columns:1fr auto;
+      gap:8px;
+      align-items:center;
+    }
+    .password-field input { min-width:0; }
+    .toggle-password {
+      min-height:42px;
+      padding:0 14px;
+      border:1px solid var(--line);
+      border-radius:12px;
+      background:#f8fbff;
+      color:var(--brand);
+      box-shadow:none;
+      font-weight:800;
+      white-space:nowrap;
+    }
+    .toggle-password:hover { background:#eef5ff; }
     input:focus { outline:none; border-color:rgba(38,92,240,.5); box-shadow:0 0 0 4px rgba(38,92,240,.10); }
     button {
       min-height:42px;
@@ -2986,9 +3079,23 @@ function loginPage(config: AppConfig, hasError: boolean): string {
     ${hasError ? `<p class="error">账号或密码错误</p>` : ""}
     <form method="post" action="/admin/login">
       <label>管理员账号<input name="username" autocomplete="username" required autofocus></label>
-      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <label>密码
+        <div class="password-field">
+          <input name="password" type="password" autocomplete="current-password" required>
+          <button type="button" class="toggle-password" onclick="togglePasswordField(this)">显示</button>
+        </div>
+      </label>
       <button type="submit">登录</button>
     </form>
+    <script>
+      function togglePasswordField(button) {
+        const field = button && button.parentElement ? button.parentElement.querySelector('input') : null;
+        if (!field) return;
+        const nextType = field.type === 'password' ? 'text' : 'password';
+        field.type = nextType;
+        button.textContent = nextType === 'password' ? '显示' : '隐藏';
+      }
+    </script>
   </main>
 </body>
 </html>`;
@@ -3063,6 +3170,25 @@ function setupPage(config: AppConfig): string {
       color:var(--text);
       background:#fff;
     }
+    .password-field {
+      display:grid;
+      grid-template-columns:1fr auto;
+      gap:8px;
+      align-items:center;
+    }
+    .password-field input { min-width:0; }
+    .toggle-password {
+      min-height:42px;
+      padding:0 14px;
+      border:1px solid var(--line);
+      border-radius:12px;
+      background:#f8fbff;
+      color:var(--brand);
+      box-shadow:none;
+      font-weight:800;
+      white-space:nowrap;
+    }
+    .toggle-password:hover { background:#eef5ff; }
     input:focus { outline:none; border-color:rgba(38,92,240,.5); box-shadow:0 0 0 4px rgba(38,92,240,.10); }
     button {
       min-height:42px;
@@ -3085,10 +3211,29 @@ function setupPage(config: AppConfig): string {
     <p>首次部署后创建后台账号，只能初始化一次。</p>
     <form method="post" action="/admin/setup">
       <label>管理员账号<input name="username" autocomplete="username" required autofocus></label>
-      <label>密码<input name="password" type="password" autocomplete="new-password" minlength="8" required></label>
-      <label>确认密码<input name="confirm_password" type="password" autocomplete="new-password" minlength="8" required></label>
+      <label>密码
+        <div class="password-field">
+          <input name="password" type="password" autocomplete="new-password" minlength="8" required>
+          <button type="button" class="toggle-password" onclick="togglePasswordField(this)">显示</button>
+        </div>
+      </label>
+      <label>确认密码
+        <div class="password-field">
+          <input name="confirm_password" type="password" autocomplete="new-password" minlength="8" required>
+          <button type="button" class="toggle-password" onclick="togglePasswordField(this)">显示</button>
+        </div>
+      </label>
       <button type="submit">创建并登录</button>
     </form>
+    <script>
+      function togglePasswordField(button) {
+        const field = button && button.parentElement ? button.parentElement.querySelector('input') : null;
+        if (!field) return;
+        const nextType = field.type === 'password' ? 'text' : 'password';
+        field.type = nextType;
+        button.textContent = nextType === 'password' ? '显示' : '隐藏';
+      }
+    </script>
   </main>
 </body>
 </html>`;
@@ -3114,7 +3259,9 @@ function publicKeyText(value: string): string {
 function alipayPrivateKeyText(value: string): string {
   return value
     .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----BEGIN RSA PRIVATE KEY-----/g, "")
     .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/-----END RSA PRIVATE KEY-----/g, "")
     .replace(/\s+/g, "");
 }
 
@@ -3341,6 +3488,9 @@ async function hmacSha256(secret: string, body: string): Promise<string> {
 }
 
 async function rsa2Sign(privateKeyPem: string, content: string): Promise<string> {
+  if (!looksLikePrivateKeyPem(privateKeyPem)) {
+    throw new Error("private key format is invalid");
+  }
   const key = await crypto.subtle.importKey(
     "pkcs8",
     pemToPrivateKeyArrayBuffer(privateKeyPem),
@@ -3395,7 +3545,9 @@ function pemToArrayBuffer(pem: string): ArrayBuffer {
 function pemToPrivateKeyArrayBuffer(pem: string): ArrayBuffer {
   const normalized = pem
     .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----BEGIN RSA PRIVATE KEY-----/g, "")
     .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/-----END RSA PRIVATE KEY-----/g, "")
     .replace(/\s+/g, "");
   return base64ToArrayBuffer(normalized);
 }
