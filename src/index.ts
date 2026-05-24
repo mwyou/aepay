@@ -1589,12 +1589,10 @@ function renderAdmin(
       const privateInput = document.querySelector('[name="alipay_private_key_pem"]');
       const publicHidden = document.querySelector('[name="alipay_app_public_key_text"]');
       const publicOutput = document.querySelector('#alipay-app-public-key-text');
-      const pemOutput = document.querySelector('#alipay-app-public-key-pem');
       const publicText = alipayPublicKeyText(publicPem);
       if (privateInput) privateInput.value = privatePem;
       if (publicHidden) publicHidden.value = publicText;
       if (publicOutput) publicOutput.value = publicText;
-      if (pemOutput) pemOutput.value = publicPem;
     }
     async function copyAlipayPublicKey() {
       const output = document.querySelector('#alipay-app-public-key-text');
@@ -1710,8 +1708,7 @@ function settingsForm(config: AppConfig): string {
       <button type="button" onclick="generateAlipayKeyPair()">生成支付宝应用密钥对</button>
       <button type="button" onclick="copyAlipayPublicKey()">复制支付宝后台专用公钥</button>
     </div>
-    <label class="wide">支付宝后台专用应用公钥，复制到支付宝开放平台<textarea id="alipay-app-public-key-text" readonly placeholder="点击“生成支付宝应用密钥对”后这里会出现一整行公钥字符串，不含头尾和换行">${escapeHtml(config.alipayAppPublicKeyText)}</textarea></label>
-    <label class="wide">应用公钥 PEM，仅备用查看<textarea id="alipay-app-public-key-pem" readonly placeholder="这里是 PEM 格式，通常不要粘到支付宝后台"></textarea></label>
+    <label class="wide">支付宝后台专用应用公钥，复制到支付宝开放平台<textarea id="alipay-app-public-key-text" readonly placeholder="点击“生成支付宝应用密钥对”后这里会出现一整行公钥字符串">${escapeHtml(config.alipayAppPublicKeyText)}</textarea></label>
     <label class="wide">支付宝应用私钥 PEM，查账必填<textarea name="alipay_private_key_pem" placeholder="${secretPlaceholder(config.alipayPrivateKeyPem)}"></textarea></label>
     <div class="note wide" style="padding:0;">当前支付宝公钥：${secretPreview(publicKeyText(config.alipayPublicKeyPem))} ${config.alipayPublicKeyPem ? `<button type="button" onclick="copyText('${escapeJs(publicKeyText(config.alipayPublicKeyPem))}')">复制支付宝公钥</button>` : ""}</div>
     <label class="wide">支付宝公钥字符串，通知验签用<textarea name="alipay_public_key_text" placeholder="粘贴支付宝开放平台提供的支付宝公钥；可带或不带 BEGIN/END，保存时会自动处理"></textarea></label>
