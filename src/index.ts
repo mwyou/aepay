@@ -93,8 +93,13 @@ interface ReconcileBody {
   collect_account?: string;
 }
 
+interface TestOrderBody {
+  amount: string;
+}
+
 interface AppConfig {
   appName: string;
+  timeZone: string;
   orderExpireMinutes: string;
   amountVarianceCents: string;
   collectAccount: string;
@@ -160,8 +165,8 @@ export default {
       if (url.pathname.startsWith("/api/orders/") && request.method === "GET") {
         return await getOrder(url.pathname.slice("/api/orders/".length), env, config, request.url);
       }
-      if (url.pathname === "/api/reconcile/manual" && request.method === "POST") {
-        return await requireAdmin(request, env, config, () => manualReconcile(request, env, config));
+      if (url.pathname === "/api/admin/test-order" && request.method === "POST") {
+        return await requireAdmin(request, env, config, () => createTestOrder(request, env, config));
       }
       if (url.pathname === "/api/alipay/notify" && request.method === "POST") {
         return await alipayNotify(request, env, config);
@@ -196,6 +201,7 @@ async function loadConfig(env: Env): Promise<AppConfig> {
   const settings = new Map(rows.results.map((row) => [row.key, row.value]));
   return {
     appName: settings.get("app_name") || env.APP_NAME || "AEPay",
+    timeZone: settings.get("time_zone") || "Asia/Shanghai",
     orderExpireMinutes: settings.get("order_expire_minutes") || env.ORDER_EXPIRE_MINUTES || "15",
     amountVarianceCents: settings.get("amount_variance_cents") || env.AMOUNT_VARIANCE_CENTS || "30",
     collectAccount: settings.get("collect_account") || env.COLLECT_ACCOUNT || "",
@@ -225,6 +231,7 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
   const collectQrImageUrl = uploadedQrImage || stringForm(form, "collect_qr_image_url") || config.collectQrImageUrl;
   const plain: Record<string, string> = {
     app_name: stringForm(form, "app_name"),
+    time_zone: stringForm(form, "time_zone") || "Asia/Shanghai",
     order_expire_minutes: stringForm(form, "order_expire_minutes"),
     amount_variance_cents: stringForm(form, "amount_variance_cents"),
     collect_account: stringForm(form, "collect_account"),
@@ -237,6 +244,7 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
     epay_pid: stringForm(form, "epay_pid"),
   };
   assertText(plain.app_name, "app_name");
+  assertTimeZone(plain.time_zone);
   assertPositiveInteger(plain.order_expire_minutes, "order_expire_minutes");
   assertPositiveInteger(plain.amount_variance_cents, "amount_variance_cents");
   if (plain.collect_qr_image_url && !plain.collect_qr_image_url.startsWith("data:image/")) {
@@ -448,15 +456,24 @@ async function createEpayOrder(request: Request, env: Env, config: AppConfig, pa
   return order;
 }
 
-async function manualReconcile(request: Request, env: Env, config: AppConfig): Promise<Response> {
-  const body = await readJson<ReconcileBody>(request);
-  const result = await recordPaymentEvent(env, config, body, body);
-  if (result.order) await dispatchCallback(env, config, result.order);
+async function createTestOrder(request: Request, env: Env, config: AppConfig): Promise<Response> {
+  const body = await readJson<TestOrderBody>(request);
+  const amount = body.amount || "0.01";
+  assertMoney(amount, "amount");
+  const merchantOrderNo = `TEST-${Date.now()}`;
+  const order = await createOrderRecord(env, config, {
+    merchant_order_no: merchantOrderNo,
+    amount,
+    notify_url: `${new URL(request.url).origin}/health`,
+    subject: "支付链路测试",
+    pay_type: "alipay",
+    compat_type: "json",
+  });
   return json({
-    event_id: result.event.id,
-    matched: Boolean(result.order),
-    merchant_order_no: result.order?.merchant_order_no ?? null,
-    status: result.order ? "matched" : "unmatched",
+    merchant_order_no: order.merchant_order_no,
+    amount: order.amount,
+    pay_amount: order.pay_amount,
+    payment_url: paymentUrl(request.url, order),
   });
 }
 
@@ -575,23 +592,23 @@ interface PolledTransaction {
 }
 
 async function queryAlipayTransactions(config: AppConfig, start: Date, end: Date): Promise<PolledTransaction[]> {
-  const payload = defaultAlipayPollPayload(config.alipayPollMethod, start, end);
+  const payload = defaultAlipayPollPayload(config, start, end);
   const response = await alipayOpenApiRequest(config, config.alipayPollMethod, payload);
   return extractPolledTransactions(response);
 }
 
-function defaultAlipayPollPayload(method: string, start: Date, end: Date): Record<string, unknown> {
-  if (method === "alipay.data.bill.accountlog.query") {
+function defaultAlipayPollPayload(config: AppConfig, start: Date, end: Date): Record<string, unknown> {
+  if (config.alipayPollMethod === "alipay.data.bill.accountlog.query") {
     return {
-      start_time: formatAlipayTime(start),
-      end_time: formatAlipayTime(end),
+      start_time: formatAlipayTime(start, config.timeZone),
+      end_time: formatAlipayTime(end, config.timeZone),
       page_no: 1,
       page_size: 1000,
     };
   }
   return {
-    start_time: formatAlipayTime(start),
-    end_time: formatAlipayTime(end),
+    start_time: formatAlipayTime(start, config.timeZone),
+    end_time: formatAlipayTime(end, config.timeZone),
     page_no: 1,
     page_size: 100,
   };
@@ -607,7 +624,7 @@ async function alipayOpenApiRequest(
     method,
     charset: "utf-8",
     sign_type: "RSA2",
-    timestamp: formatAlipayTime(new Date()),
+    timestamp: formatAlipayTime(new Date(), config.timeZone),
     version: "1.0",
     biz_content: JSON.stringify(bizContent),
   };
@@ -1229,22 +1246,20 @@ function renderAdmin(
       <button class="tab" type="button" data-tab="system">系统</button>
       <button class="tab" type="button" data-tab="epay">易支付</button>
       <button class="tab" type="button" data-tab="alipay">支付宝</button>
-      <button class="tab" type="button" data-tab="debug">调试</button>
+      <button class="tab" type="button" data-tab="test">支付测试</button>
     </nav>
     <section id="settings-section" hidden>
       <h2>设置</h2>
       ${settingsForm(config)}
     </section>
-    <section class="panel" data-panel="debug" hidden>
-      <h2>调试核销</h2>
-      <form method="post" action="/api/reconcile/manual" onsubmit="return submitReconcile(event)">
-        <label>支付宝交易号<input name="alipay_trade_no" required></label>
-        <label>金额<input name="amount" required placeholder="9.91"></label>
-        <label>支付时间<input name="paid_at" required></label>
-        <label>付款方<input name="payer"></label>
-        <button type="submit">模拟到账</button>
+    <section class="panel" data-panel="test" hidden>
+      <h2>真实支付测试</h2>
+      <form method="post" action="/api/admin/test-order" onsubmit="return submitTestOrder(event)" style="grid-template-columns:minmax(180px,260px) auto 1fr;">
+        <label>测试原金额<input name="amount" required value="0.01" inputmode="decimal"></label>
+        <button type="submit">创建测试订单</button>
+        <div class="note" style="padding:0;">系统会生成实际应付金额；打开支付页后按页面金额真实扫码付款，再等自动查账匹配。</div>
       </form>
-      <div class="note">仅用于开发测试自动匹配和回调链路；正式流程由自动查账完成。</div>
+      <div id="test-order-result" class="note"></div>
     </section>
     <section class="panel" data-panel="alipay" hidden>
       <h2>自动查账</h2>
@@ -1252,23 +1267,22 @@ function renderAdmin(
         <div class="note" style="padding:0;">开启自动查账并保存支付宝配置后，Cron 每分钟执行一次；这里也可以手动立即测试。</div>
         <button type="submit">立即查账</button>
       </form>
-      <div class="scroll">${pollingRunsTable(pollingRuns)}</div>
+      <div class="scroll">${pollingRunsTable(pollingRuns, config.timeZone)}</div>
     </section>
     <section class="panel" data-panel="overview">
       <h2>订单</h2>
-      <div class="scroll">${ordersTable(orders)}</div>
+      <div class="scroll">${ordersTable(orders, config.timeZone)}</div>
     </section>
     <section class="panel" data-panel="overview">
       <h2>到账事件</h2>
-      <div class="scroll">${eventsTable(events)}</div>
+      <div class="scroll">${eventsTable(events, config.timeZone)}</div>
     </section>
     <section class="panel" data-panel="overview">
       <h2>回调日志</h2>
-      <div class="scroll">${callbacksTable(callbacks)}</div>
+      <div class="scroll">${callbacksTable(callbacks, config.timeZone)}</div>
     </section>
   </main>
   <script>
-    document.querySelector('input[name="paid_at"]').value = new Date().toISOString();
     document.querySelectorAll('[data-tab]').forEach(button => {
       button.addEventListener('click', () => {
         const target = button.dataset.tab;
@@ -1280,17 +1294,23 @@ function renderAdmin(
         });
       });
     });
-    async function submitReconcile(event) {
+    async function submitTestOrder(event) {
       event.preventDefault();
       const form = event.currentTarget;
       const body = Object.fromEntries(new FormData(form).entries());
-      const res = await fetch('/api/reconcile/manual', {
+      const res = await fetch('/api/admin/test-order', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body)
       });
-      alert(await res.text());
-      if (res.ok) location.reload();
+      const text = await res.text();
+      if (!res.ok) {
+        alert(text);
+        return false;
+      }
+      const data = JSON.parse(text);
+      const target = document.querySelector('#test-order-result');
+      target.innerHTML = '测试订单 ' + data.merchant_order_no + '，实际应付 <strong>¥' + data.pay_amount + '</strong>。<a href="' + data.payment_url + '" target="_blank" rel="noopener">打开支付页</a>';
       return false;
     }
     async function submitPolling(event) {
@@ -1318,6 +1338,15 @@ function settingsForm(config: AppConfig): string {
     <div class="panel" data-panel="system" hidden style="display:contents;">
     <div class="note wide" style="padding:0;">系统页只放本系统自己的行为设置和管理员账号。</div>
     <label>系统名称<input name="app_name" value="${escapeAttr(config.appName)}" required></label>
+    <label>显示时区
+      <select name="time_zone">
+        ${timeZoneOption(config.timeZone, "Asia/Shanghai", "北京时间 Asia/Shanghai")}
+        ${timeZoneOption(config.timeZone, "UTC", "UTC")}
+        ${timeZoneOption(config.timeZone, "Asia/Hong_Kong", "香港 Asia/Hong_Kong")}
+        ${timeZoneOption(config.timeZone, "Asia/Tokyo", "东京 Asia/Tokyo")}
+        ${timeZoneOption(config.timeZone, "America/Los_Angeles", "洛杉矶 America/Los_Angeles")}
+      </select>
+    </label>
     <label>订单过期分钟<input name="order_expire_minutes" value="${escapeAttr(config.orderExpireMinutes)}" inputmode="numeric" required></label>
     <label>金额尾数范围<input name="amount_variance_cents" value="${escapeAttr(config.amountVarianceCents)}" inputmode="numeric" required></label>
     <label>回调 HMAC 密钥，仅 JSON 回调用<input name="callback_secret" type="password" placeholder="${secretPlaceholder(config.callbackSecret)}"></label>
@@ -1436,7 +1465,11 @@ function secretPlaceholder(value: string): string {
   return value ? "已配置，留空不修改" : "未配置";
 }
 
-function ordersTable(rows: OrderRow[]): string {
+function timeZoneOption(current: string, value: string, label: string): string {
+  return `<option value="${escapeAttr(value)}"${current === value ? " selected" : ""}>${escapeHtml(label)}</option>`;
+}
+
+function ordersTable(rows: OrderRow[], timeZone: string): string {
   return table(
     ["订单号", "原金额", "应付", "模式", "状态", "交易号", "创建", "过期"],
     rows.map((row) => [
@@ -1446,13 +1479,13 @@ function ordersTable(rows: OrderRow[]): string {
       row.compat_type,
       statusPill(row.status),
       row.alipay_trade_no || "-",
-      shortDate(row.created_at),
-      shortDate(row.expires_at),
+      shortDate(row.created_at, timeZone),
+      shortDate(row.expires_at, timeZone),
     ]),
   );
 }
 
-function eventsTable(rows: PaymentEventRow[]): string {
+function eventsTable(rows: PaymentEventRow[], timeZone: string): string {
   return table(
     ["交易号", "金额", "付款方", "匹配订单", "支付时间"],
     rows.map((row) => [
@@ -1460,12 +1493,12 @@ function eventsTable(rows: PaymentEventRow[]): string {
       row.amount,
       row.payer || "-",
       row.matched_order_id ? String(row.matched_order_id) : "-",
-      shortDate(row.paid_at),
+      shortDate(row.paid_at, timeZone),
     ]),
   );
 }
 
-function callbacksTable(rows: CallbackLogRow[]): string {
+function callbacksTable(rows: CallbackLogRow[], timeZone: string): string {
   return table(
     ["订单 ID", "状态", "HTTP", "次数", "地址", "时间"],
     rows.map((row) => [
@@ -1474,21 +1507,21 @@ function callbacksTable(rows: CallbackLogRow[]): string {
       row.response_status ? String(row.response_status) : "-",
       String(row.attempts),
       row.notify_url,
-      shortDate(row.created_at),
+      shortDate(row.created_at, timeZone),
     ]),
   );
 }
 
-function pollingRunsTable(rows: PollingRunRow[]): string {
+function pollingRunsTable(rows: PollingRunRow[], timeZone: string): string {
   return table(
     ["状态", "查账窗口", "获取", "匹配", "错误", "时间"],
     rows.map((row) => [
       statusPill(row.status),
-      `${shortDate(row.window_start)} - ${shortDate(row.window_end)}`,
+      `${shortDate(row.window_start, timeZone)} - ${shortDate(row.window_end, timeZone)}`,
       String(row.fetched_count),
       String(row.matched_count),
       row.error ? escapeHtml(row.error) : "-",
-      shortDate(row.started_at),
+      shortDate(row.started_at, timeZone),
     ]),
   );
 }
@@ -1694,9 +1727,9 @@ function hex(buffer: ArrayBuffer): string {
   return [...new Uint8Array(buffer)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function formatAlipayTime(date: Date): string {
+function formatAlipayTime(date: Date, timeZone: string): string {
   const parts = new Intl.DateTimeFormat("zh-CN", {
-    timeZone: "Asia/Shanghai",
+    timeZone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -1760,6 +1793,14 @@ function assertMoney(value: string, field: string): void {
 
 function assertPositiveInteger(value: string, field: string): void {
   if (!/^[1-9]\d*$/.test(value)) throw new Error(`${field} must be a positive integer`);
+}
+
+function assertTimeZone(value: string): void {
+  try {
+    new Intl.DateTimeFormat("zh-CN", { timeZone: value }).format(new Date());
+  } catch {
+    throw new Error("time_zone must be a valid IANA timezone");
+  }
 }
 
 function assertUrl(value: string, field: string): void {
@@ -1925,8 +1966,26 @@ function isSqlConflict(error: unknown): boolean {
   return message.includes("UNIQUE") || message.includes("constraint");
 }
 
-function shortDate(value: string | null): string {
-  return value ? escapeHtml(value.replace("T", " ").replace(".000Z", "Z")) : "-";
+function shortDate(value: string | null, timeZone: string): string {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return escapeHtml(value);
+  return escapeHtml(formatDisplayTime(date, timeZone));
+}
+
+function formatDisplayTime(date: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day} ${value.hour}:${value.minute}:${value.second}`;
 }
 
 function escapeHtml(value: string): string {

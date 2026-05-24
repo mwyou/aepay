@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS system_settings (
 
 INSERT OR IGNORE INTO system_settings (key, value, is_secret, updated_at) VALUES
   ('app_name', 'AEPay', 0, datetime('now')),
+  ('time_zone', 'Asia/Shanghai', 0, datetime('now')),
   ('order_expire_minutes', '15', 0, datetime('now')),
   ('amount_variance_cents', '30', 0, datetime('now')),
   ('collect_account', '', 0, datetime('now')),
