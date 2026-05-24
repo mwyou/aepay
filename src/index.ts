@@ -167,7 +167,7 @@ export default {
       if (url.pathname === "/admin/login" && request.method === "GET") return html(loginPage(config, url.searchParams.get("error") === "1"));
       if (url.pathname === "/admin/login" && request.method === "POST") return await adminLogin(request, env, config);
       if (url.pathname === "/admin/logout" && request.method === "POST") return adminLogout(request);
-      if (url.pathname === "/admin" && request.method === "GET") return await requireAdmin(request, env, config, () => adminPage(env, config));
+      if (url.pathname === "/admin" && request.method === "GET") return await requireAdmin(request, env, config, () => adminPage(request, env, config));
       if (url.pathname === "/api/admin/settings" && request.method === "POST") {
         return await requireAdmin(request, env, config, () => updateSettings(request, env, config));
       }
@@ -270,10 +270,22 @@ async function loadConfig(env: Env): Promise<AppConfig> {
   };
 }
 
+type AdminTab = "overview" | "system" | "epay" | "payment" | "alipay" | "test";
+
+function adminTabFromValue(value: string): AdminTab {
+  if (value === "system" || value === "epay" || value === "payment" || value === "alipay" || value === "test") return value;
+  return "overview";
+}
+
+function isSettingsTab(tab: AdminTab): boolean {
+  return tab === "system" || tab === "epay" || tab === "payment" || tab === "alipay";
+}
+
 async function updateSettings(request: Request, env: Env, config: AppConfig): Promise<Response> {
   const form = await request.formData();
   const now = new Date().toISOString();
   const alipayPublicKeyInput = stringForm(form, "alipay_public_key_text") || stringForm(form, "alipay_public_key_pem");
+  const adminTab = adminTabFromValue(stringForm(form, "admin_tab"));
   const plain: Record<string, string> = {
     app_name: stringForm(form, "app_name"),
     time_zone: stringForm(form, "time_zone") || "Asia/Shanghai",
@@ -323,7 +335,13 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
     await upsertSetting(env, "admin_password_hash", await adminPasswordHash(usernameForHash, adminPassword), true, now);
   }
 
-  return Response.redirect(new URL("/admin?saved=1", request.url), 302);
+  if ((request.headers.get("accept") || "").includes("application/json") || request.headers.get("x-requested-with") === "fetch") {
+    return json({ status: "success", message: "设置已保存", tab: adminTab });
+  }
+
+  const redirectUrl = new URL("/admin", request.url);
+  if (adminTab !== "overview") redirectUrl.searchParams.set("tab", adminTab);
+  return Response.redirect(redirectUrl, 302);
 }
 
 async function upsertSetting(env: Env, key: string, value: string, isSecret: boolean, updatedAt: string): Promise<void> {
@@ -533,8 +551,18 @@ function normalizePublicKeyPem(value: string): string {
   return `-----BEGIN PUBLIC KEY-----\n${compact.match(/.{1,64}/g)?.join("\n") || compact}\n-----END PUBLIC KEY-----`;
 }
 
-function looksLikePrivateKeyPem(value: string): boolean {
-  return value.includes("-----BEGIN PRIVATE KEY-----") || value.includes("-----BEGIN RSA PRIVATE KEY-----");
+function normalizePrivateKeyPem(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed.includes("-----BEGIN PRIVATE KEY-----") || trimmed.includes("-----BEGIN RSA PRIVATE KEY-----")) {
+    return trimmed;
+  }
+  const compact = trimmed.replace(/\s+/g, "");
+  return `-----BEGIN PRIVATE KEY-----\n${compact.match(/.{1,64}/g)?.join("\n") || compact}\n-----END PRIVATE KEY-----`;
+}
+
+function isPkcs1PrivateKey(value: string): boolean {
+  return value.includes("-----BEGIN RSA PRIVATE KEY-----");
 }
 
 async function createOrder(request: Request, env: Env, config: AppConfig): Promise<Response> {
@@ -805,15 +833,19 @@ async function diagnoseAlipaySignatureFailure(config?: AppConfig): Promise<strin
 }
 
 async function validateAlipayAppKeyPair(config: AppConfig): Promise<{ ok: boolean; message: string }> {
-  const privateKeyPem = config.alipayPrivateKeyPem.trim();
+  const privateKeyPem = normalizePrivateKeyPem(config.alipayPrivateKeyPem);
   const appPublicKeyText = config.alipayAppPublicKeyText.trim();
   if (!privateKeyPem || !appPublicKeyText) {
     return { ok: false, message: "请先保存应用私钥和应用公钥，再把应用公钥同步到支付宝开放平台" };
   }
+  if (isPkcs1PrivateKey(privateKeyPem)) {
+    return { ok: false, message: "当前私钥是 PKCS#1 格式，Workers 只支持 PKCS#8；请用后台按钮重新生成应用密钥对并保存" };
+  }
   try {
-    const probe = "aepay-alipay-key-check";
-    const signature = await rsa2Sign(privateKeyPem, probe);
-    const verified = await verifyAlipayRsa2({ probe, sign: signature }, normalizePublicKeyPem(appPublicKeyText));
+    const probe = { app_id: config.alipayAppId || "aepay", method: "aepay.key.check", timestamp: "2026-05-24 00:00:00" };
+    const content = alipaySignContent(probe);
+    const signature = await rsa2Sign(privateKeyPem, content);
+    const verified = await verifyAlipayRsa2({ ...probe, sign: signature }, normalizePublicKeyPem(appPublicKeyText));
     if (!verified) {
       return { ok: false, message: "当前应用私钥和应用公钥不是同一对，请重新生成后保存，再把新的应用公钥同步到支付宝开放平台" };
     }
@@ -833,6 +865,8 @@ async function alipayKeyCheck(config: AppConfig): Promise<Response> {
     app_id_present: Boolean(config.alipayAppId.trim()),
     private_key_present: Boolean(config.alipayPrivateKeyPem.trim()),
     app_public_key_present: Boolean(config.alipayAppPublicKeyText.trim()),
+    private_key_preview: secretPreview(alipayPrivateKeyText(config.alipayPrivateKeyPem)),
+    app_public_key_preview: secretPreview(config.alipayAppPublicKeyText),
   });
 }
 
@@ -1229,7 +1263,8 @@ async function buildCallback(config: AppConfig, order: OrderRow): Promise<{ body
   };
 }
 
-async function adminPage(env: Env, config: AppConfig): Promise<Response> {
+async function adminPage(request: Request, env: Env, config: AppConfig): Promise<Response> {
+  const activeTab = adminTabFromValue(new URL(request.url).searchParams.get("tab") || "");
   await expirePendingOrders(env);
   const [orders, events, callbacks, pollingRuns] = await Promise.all([
     env.DB.prepare("SELECT * FROM orders ORDER BY id DESC LIMIT 50").all<OrderRow>(),
@@ -1237,7 +1272,7 @@ async function adminPage(env: Env, config: AppConfig): Promise<Response> {
     env.DB.prepare("SELECT * FROM callback_logs ORDER BY id DESC LIMIT 30").all<CallbackLogRow>(),
     env.DB.prepare("SELECT * FROM polling_runs ORDER BY id DESC LIMIT 20").all<PollingRunRow>(),
   ]);
-  return html(renderAdmin(config, orders.results, events.results, callbacks.results, pollingRuns.results));
+  return html(renderAdmin(config, orders.results, events.results, callbacks.results, pollingRuns.results, activeTab));
 }
 
 async function adminOrders(env: Env): Promise<Response> {
@@ -1945,6 +1980,7 @@ function renderAdmin(
   events: PaymentEventRow[],
   callbacks: CallbackLogRow[],
   pollingRuns: PollingRunRow[],
+  activeTab: AdminTab,
 ): string {
   const totalOrders = orders.length;
   const paidOrders = orders.filter((row) => row.status === "paid").length;
@@ -2360,18 +2396,18 @@ function renderAdmin(
       </div>
     </section>
     <nav class="tabs" aria-label="后台导航">
-      <button class="tab active" type="button" data-tab="overview">概览</button>
-      <button class="tab" type="button" data-tab="system">系统</button>
-      <button class="tab" type="button" data-tab="epay">易支付</button>
-      <button class="tab" type="button" data-tab="payment">支付页</button>
-      <button class="tab" type="button" data-tab="alipay">支付宝</button>
-      <button class="tab" type="button" data-tab="test">支付测试</button>
+      <button class="tab${activeTab === "overview" ? " active" : ""}" type="button" data-tab="overview">概览</button>
+      <button class="tab${activeTab === "system" ? " active" : ""}" type="button" data-tab="system">系统</button>
+      <button class="tab${activeTab === "epay" ? " active" : ""}" type="button" data-tab="epay">易支付</button>
+      <button class="tab${activeTab === "payment" ? " active" : ""}" type="button" data-tab="payment">支付页</button>
+      <button class="tab${activeTab === "alipay" ? " active" : ""}" type="button" data-tab="alipay">支付宝</button>
+      <button class="tab${activeTab === "test" ? " active" : ""}" type="button" data-tab="test">支付测试</button>
     </nav>
-    <section id="settings-section" hidden>
+    <section id="settings-section"${isSettingsTab(activeTab) ? "" : " hidden"}>
       <h2>设置</h2>
-      ${settingsForm(config)}
+      ${settingsForm(config, activeTab)}
     </section>
-    <section class="panel" data-panel="test" hidden>
+    <section class="panel" data-panel="test"${activeTab === "test" ? "" : " hidden"}>
       <h2>真实支付测试</h2>
       <form method="post" action="/api/admin/test-order" onsubmit="return submitTestOrder(event)" style="grid-template-columns:minmax(180px,260px) auto 1fr;">
         <label>测试原金额<input name="amount" required value="0.01" inputmode="decimal"></label>
@@ -2380,7 +2416,7 @@ function renderAdmin(
       </form>
       <div id="test-order-result" class="note"></div>
     </section>
-    <section class="panel" data-panel="alipay" hidden>
+    <section class="panel" data-panel="alipay"${activeTab === "alipay" ? "" : " hidden"}>
       <h2>自动查账</h2>
       <form method="post" action="/api/admin/polling/run" onsubmit="return submitPolling(event)" style="grid-template-columns:1fr auto;">
         <div class="note" style="padding:0;">开启自动查账并保存支付宝配置后，Cron 每分钟执行一次；这里也可以手动立即测试。</div>
@@ -2388,31 +2424,108 @@ function renderAdmin(
       </form>
       <div class="scroll">${pollingRunsTable(pollingRuns, config.timeZone)}</div>
     </section>
-    <section class="panel" data-panel="overview">
+    <section class="panel" data-panel="overview"${activeTab === "overview" ? "" : " hidden"}>
       <h2>订单</h2>
       <div class="scroll">${ordersTable(orders, config.timeZone)}</div>
     </section>
-    <section class="panel" data-panel="overview">
+    <section class="panel" data-panel="overview"${activeTab === "overview" ? "" : " hidden"}>
       <h2>到账事件</h2>
       <div class="scroll">${eventsTable(events, config.timeZone)}</div>
     </section>
-    <section class="panel" data-panel="overview">
+    <section class="panel" data-panel="overview"${activeTab === "overview" ? "" : " hidden"}>
       <h2>回调日志</h2>
       <div class="scroll">${callbacksTable(callbacks, config.timeZone)}</div>
     </section>
   </main>
   <script>
+    const adminTabStorageKey = 'aepay-admin-tab';
+    const adminTabs = ['overview', 'system', 'epay', 'payment', 'alipay', 'test'];
+    function isAdminTab(value) {
+      return adminTabs.includes(value);
+    }
+    function readAdminTabStorage() {
+      try {
+        return sessionStorage.getItem(adminTabStorageKey) || '';
+      } catch {
+        return '';
+      }
+    }
+    function writeAdminTabStorage(value) {
+      try {
+        sessionStorage.setItem(adminTabStorageKey, value);
+      } catch {
+      }
+    }
+    function initialAdminTab() {
+      const hash = location.hash ? location.hash.slice(1) : '';
+      if (isAdminTab(hash)) return hash;
+      const query = new URLSearchParams(location.search).get('tab') || '';
+      if (isAdminTab(query)) return query;
+      const stored = readAdminTabStorage();
+      if (isAdminTab(stored)) return stored;
+      return 'overview';
+    }
+    function applyAdminTab(target, persist = true) {
+      const next = isAdminTab(target) ? target : 'overview';
+      document.querySelectorAll('[data-tab]').forEach(item => item.classList.toggle('active', item.dataset.tab === next));
+      const settings = document.querySelector('#settings-section');
+      if (settings) settings.hidden = !['system', 'epay', 'payment', 'alipay'].includes(next);
+      document.querySelectorAll('[data-panel]').forEach(panel => {
+        panel.hidden = panel.dataset.panel !== next;
+      });
+      const hiddenTab = document.querySelector('[name="admin_tab"]');
+      if (hiddenTab) hiddenTab.value = next;
+      if (persist) {
+        writeAdminTabStorage(next);
+        const url = new URL(location.href);
+        if (next === 'overview') url.searchParams.delete('tab');
+        else url.searchParams.set('tab', next);
+        url.hash = '';
+        history.replaceState(null, '', url.toString());
+      }
+    }
+    applyAdminTab(initialAdminTab(), false);
     document.querySelectorAll('[data-tab]').forEach(button => {
       button.addEventListener('click', () => {
-        const target = button.dataset.tab;
-        document.querySelectorAll('[data-tab]').forEach(item => item.classList.toggle('active', item === button));
-        const settings = document.querySelector('#settings-section');
-        if (settings) settings.hidden = !['system', 'epay', 'payment', 'alipay'].includes(target);
-        document.querySelectorAll('[data-panel]').forEach(panel => {
-          panel.hidden = panel.dataset.panel !== target;
-        });
+        applyAdminTab(button.dataset.tab || 'overview');
       });
     });
+    async function submitSettings(event) {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const submitButton = form.querySelector('button[type="submit"]');
+      const body = new FormData(form);
+      body.set('admin_tab', document.querySelector('[name="admin_tab"]')?.value || initialAdminTab());
+      if (submitButton) submitButton.disabled = true;
+      showStatus('settings-save-status', '正在保存设置...');
+      try {
+        const res = await fetch('/api/admin/settings', {
+          method: 'POST',
+          headers: { accept: 'application/json' },
+          body
+        });
+        const text = await res.text();
+        let data = null;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = null;
+        }
+        if (!res.ok) {
+          showStatus('settings-save-status', (data && data.detail) ? data.detail : text || '保存失败', true);
+          return false;
+        }
+        const nextTab = data && typeof data.tab === 'string' && isAdminTab(data.tab) ? data.tab : initialAdminTab();
+        showStatus('settings-save-status', (data && data.message) ? data.message : '设置已保存');
+        applyAdminTab(nextTab);
+        window.setTimeout(() => location.reload(), 150);
+      } catch (error) {
+        showStatus('settings-save-status', error instanceof Error ? error.message : '网络请求失败', true);
+      } finally {
+        if (submitButton) submitButton.disabled = false;
+      }
+      return false;
+    }
     async function submitTestOrder(event) {
       event.preventDefault();
       const form = event.currentTarget;
@@ -2439,6 +2552,9 @@ function renderAdmin(
       if (res.ok) location.reload();
       return false;
     }
+    document.querySelectorAll('form[action="/api/admin/settings"]').forEach(form => {
+      form.addEventListener('submit', submitSettings);
+    });
     function fillSecret(name) {
       const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
       const bytes = new Uint8Array(40);
@@ -2528,7 +2644,8 @@ function renderAdmin(
         if (privatePreview) privatePreview.textContent = previewSecretText(alipayPrivateKeyText(privatePem));
         if (publicHidden) publicHidden.value = publicText;
         if (publicPreview) publicPreview.textContent = previewSecretText(publicText);
-        showStatus('alipay-key-status', '密钥对已生成：私钥已填入本页，应用公钥已准备好复制；点击“保存设置”后生效。');
+        showStatus('alipay-key-status', '密钥对已生成：先点击“保存设置”，保存后再校验；再把新的应用公钥复制到支付宝开放平台。');
+        showStatus('alipay-key-check-status', '刚生成的新密钥还没有保存，当前校验按钮仍会检查已保存的旧配置。');
       } catch (error) {
         const message = error instanceof Error ? error.message : '生成失败';
         showStatus('alipay-key-status', message, true);
@@ -2544,7 +2661,7 @@ function renderAdmin(
       }
       try {
         await navigator.clipboard.writeText(output.value);
-        alert('已复制支付宝后台专用应用公钥字符串');
+        alert('已复制应用公钥字符串，请粘贴到支付宝开放平台的应用公钥位置');
       } catch {
         window.prompt('浏览器拦截了自动复制，请手动复制：', output.value);
       }
@@ -2552,6 +2669,11 @@ function renderAdmin(
     async function checkAlipayKeyPair() {
       const target = 'alipay-key-check-status';
       try {
+        const privateInput = document.querySelector('[name="alipay_private_key_pem"]');
+        if (privateInput && privateInput.value.trim()) {
+          showStatus(target, '你刚生成的新密钥还没保存。请先点页面底部“保存设置”，保存后再校验。', true);
+          return;
+        }
         showStatus(target, '正在校验本地应用密钥对...');
         const res = await fetch('/api/admin/alipay-key-check', { method: 'POST' });
         const text = await res.text();
@@ -2561,7 +2683,10 @@ function renderAdmin(
         } catch {
           data = null;
         }
-        const message = data && typeof data.message === 'string' ? data.message : text;
+        const preview = data && data.private_key_preview && data.app_public_key_preview
+          ? ' 当前私钥：' + data.private_key_preview + '，应用公钥：' + data.app_public_key_preview + '。'
+          : '';
+        const message = data && typeof data.message === 'string' ? data.message + preview : text;
         showStatus(target, message, !res.ok || !data || data.status !== 'success');
       } catch (error) {
         showStatus(target, error instanceof Error ? error.message : '校验失败', true);
@@ -2734,8 +2859,9 @@ function renderAdmin(
 </html>`;
 }
 
-function settingsForm(config: AppConfig): string {
+function settingsForm(config: AppConfig, activeTab: AdminTab): string {
   return `<form class="settings-form" method="post" action="/api/admin/settings" enctype="multipart/form-data">
+    <input name="admin_tab" type="hidden" value="${escapeAttr(activeTab)}">
     <div class="panel" data-panel="system" hidden style="display:contents;">
     <div class="note wide" style="padding:0;">系统页只放本系统自己的行为设置和管理员账号。</div>
     <label>系统名称<input name="app_name" value="${escapeAttr(config.appName)}" required></label>
@@ -2819,7 +2945,7 @@ function settingsForm(config: AppConfig): string {
     <label>查账接口<input value="支付宝商家账户账务明细查询" disabled></label>
     <label>查账回看分钟<input name="alipay_poll_window_minutes" value="${escapeAttr(config.alipayPollWindowMinutes)}" inputmode="numeric" required></label>
     <label class="wide">支付宝网关，默认即可<input name="alipay_gateway_url" value="${escapeAttr(config.alipayGatewayUrl)}" required></label>
-    <div class="note wide" style="padding:0; font-weight:700; color:#1f2937;">AEPay 应用密钥：私钥保存在本系统，公钥复制到支付宝开放平台。</div>
+    <div class="note wide" style="padding:0; font-weight:700; color:#1f2937;">AEPay 应用密钥：点击生成后必须先保存设置；保存后的应用公钥再复制到支付宝开放平台。</div>
     <label>支付宝通知验签
       <select name="alipay_notify_verify_required">
         <option value="true"${config.alipayNotifyVerifyRequired === "true" ? " selected" : ""}>开启</option>
@@ -2828,20 +2954,21 @@ function settingsForm(config: AppConfig): string {
     </label>
     <div class="wide" style="display:flex; flex-wrap:wrap; gap:10px;">
       <button id="generate-alipay-key-button" type="button" onclick="generateAlipayKeyPair()">生成支付宝应用密钥对</button>
-      <button type="button" onclick="copyAlipayPublicKey()">复制支付宝后台专用公钥</button>
-      <button type="button" onclick="checkAlipayKeyPair()">校验应用密钥对</button>
+      <button type="button" onclick="copyAlipayPublicKey()">复制应用公钥</button>
+      <button type="button" onclick="checkAlipayKeyPair()">校验已保存密钥对</button>
     </div>
     <div id="alipay-key-status" class="action-status wide"></div>
     <div id="alipay-key-check-status" class="action-status wide"></div>
     <div class="note wide" style="padding:0;">当前应用私钥：<span id="alipay-app-private-key-preview">${secretPreview(alipayPrivateKeyText(config.alipayPrivateKeyPem))}</span></div>
     <input name="alipay_private_key_pem" type="hidden" value="">
     <div class="note wide" style="padding:0;">当前应用公钥：<span id="alipay-app-public-key-preview">${secretPreview(config.alipayAppPublicKeyText)}</span> ${config.alipayAppPublicKeyText ? `<button type="button" onclick="copyAlipayPublicKey()">复制应用公钥</button>` : ""}</div>
-    <div class="note wide" style="padding:0; font-weight:700; color:#1f2937;">支付宝平台公钥：从支付宝开放平台复制到这里，用于通知验签。它不是上面的应用公钥。</div>
+    <div class="note wide" style="padding:0; font-weight:700; color:#1f2937;">支付宝平台公钥：从支付宝开放平台复制到这里，只用于通知验签。它不是上面的应用公钥，也不能复制到“应用公钥”位置。</div>
     <div class="note wide" style="padding:0;">当前支付宝公钥：${secretPreview(publicKeyText(config.alipayPublicKeyPem))} ${config.alipayPublicKeyPem ? `<button type="button" onclick="copyText('${escapeJs(publicKeyText(config.alipayPublicKeyPem))}')">复制支付宝公钥</button>` : ""}</div>
     <label class="wide">支付宝公钥<textarea name="alipay_public_key_text" placeholder="粘贴支付宝开放平台提供的支付宝公钥字符串，保存时会自动处理格式"></textarea></label>
     </div>
 
     <button type="submit">保存设置</button>
+    <div id="settings-save-status" class="action-status wide"></div>
     <div class="note wide">密钥类字段留空表示不修改；易支付接入只需要配置易支付 PID 和易支付 Key。商户 API Key 只给直接调用 /api/orders 的程序用。订单过期分钟和金额尾数范围已放到支付页设置里。</div>
   </form>`;
 }
@@ -3488,12 +3615,13 @@ async function hmacSha256(secret: string, body: string): Promise<string> {
 }
 
 async function rsa2Sign(privateKeyPem: string, content: string): Promise<string> {
-  if (!looksLikePrivateKeyPem(privateKeyPem)) {
+  const normalizedPrivateKeyPem = normalizePrivateKeyPem(privateKeyPem);
+  if (!normalizedPrivateKeyPem || isPkcs1PrivateKey(normalizedPrivateKeyPem)) {
     throw new Error("private key format is invalid");
   }
   const key = await crypto.subtle.importKey(
     "pkcs8",
-    pemToPrivateKeyArrayBuffer(privateKeyPem),
+    pemToPrivateKeyArrayBuffer(normalizedPrivateKeyPem),
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false,
     ["sign"],
