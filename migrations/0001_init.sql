@@ -106,6 +106,7 @@ INSERT OR IGNORE INTO system_settings (key, value, is_secret, updated_at) VALUES
   ('alipay_poll_window_minutes', '10', 0, datetime('now')),
   ('alipay_gateway_url', 'https://openapi.alipay.com/gateway.do', 0, datetime('now')),
   ('alipay_app_id', '', 1, datetime('now')),
+  ('alipay_app_public_key_text', '', 0, datetime('now')),
   ('alipay_private_key_pem', '', 1, datetime('now')),
   ('alipay_notify_verify_required', 'true', 0, datetime('now')),
   ('alipay_public_key_pem', '', 1, datetime('now')),

@@ -110,6 +110,7 @@ interface AppConfig {
   alipayPollWindowMinutes: string;
   alipayGatewayUrl: string;
   alipayAppId: string;
+  alipayAppPublicKeyText: string;
   alipayPrivateKeyPem: string;
   alipayNotifyVerifyRequired: string;
   alipayPublicKeyPem: string;
@@ -216,6 +217,7 @@ async function loadConfig(env: Env): Promise<AppConfig> {
     alipayPollWindowMinutes: settings.get("alipay_poll_window_minutes") || "10",
     alipayGatewayUrl: settings.get("alipay_gateway_url") || "https://openapi.alipay.com/gateway.do",
     alipayAppId: settings.get("alipay_app_id") || env.ALIPAY_APP_ID || "",
+    alipayAppPublicKeyText: settings.get("alipay_app_public_key_text") || "",
     alipayPrivateKeyPem: settings.get("alipay_private_key_pem") || env.ALIPAY_PRIVATE_KEY_PEM || "",
     alipayNotifyVerifyRequired:
       settings.get("alipay_notify_verify_required") || env.ALIPAY_NOTIFY_VERIFY_REQUIRED || "true",
@@ -246,6 +248,7 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
     alipay_poll_method: "alipay.data.bill.accountlog.query",
     alipay_poll_window_minutes: stringForm(form, "alipay_poll_window_minutes"),
     alipay_gateway_url: stringForm(form, "alipay_gateway_url"),
+    alipay_app_public_key_text: stringForm(form, "alipay_app_public_key_text") || config.alipayAppPublicKeyText,
     alipay_notify_verify_required: stringForm(form, "alipay_notify_verify_required") === "true" ? "true" : "false",
     epay_pid: stringForm(form, "epay_pid"),
   };
@@ -344,6 +347,7 @@ async function seedDefaultSettings(env: Env): Promise<void> {
     ["alipay_poll_window_minutes", "10", false],
     ["alipay_gateway_url", "https://openapi.alipay.com/gateway.do", false],
     ["alipay_app_id", "", true],
+    ["alipay_app_public_key_text", "", false],
     ["alipay_private_key_pem", "", true],
     ["alipay_notify_verify_required", "true", false],
     ["alipay_public_key_pem", "", true],
@@ -617,7 +621,7 @@ async function runAlipayPolling(
 
 function friendlyPollingError(message: string): string {
   if (message.includes("isv.invalid-signature")) {
-    return "支付宝验签失败：应用私钥与支付宝开放平台配置的应用公钥不匹配";
+    return "支付宝验签失败：请把 AEPay 已保存的应用公钥复制到支付宝开放平台，并确认当前应用私钥已保存";
   }
   return message.split("&amp;")[0].slice(0, 300);
 }
@@ -1519,10 +1523,13 @@ function renderAdmin(
       const privatePem = pemFromBase64(btoa(String.fromCharCode(...new Uint8Array(privateKey))), 'PRIVATE KEY');
       const publicPem = pemFromBase64(btoa(String.fromCharCode(...new Uint8Array(publicKey))), 'PUBLIC KEY');
       const privateInput = document.querySelector('[name="alipay_private_key_pem"]');
+      const publicHidden = document.querySelector('[name="alipay_app_public_key_text"]');
       const publicOutput = document.querySelector('#alipay-app-public-key-text');
       const pemOutput = document.querySelector('#alipay-app-public-key-pem');
+      const publicText = alipayPublicKeyText(publicPem);
       if (privateInput) privateInput.value = privatePem;
-      if (publicOutput) publicOutput.value = alipayPublicKeyText(publicPem);
+      if (publicHidden) publicHidden.value = publicText;
+      if (publicOutput) publicOutput.value = publicText;
       if (pemOutput) pemOutput.value = publicPem;
     }
     async function copyAlipayPublicKey() {
@@ -1619,6 +1626,7 @@ function settingsForm(config: AppConfig): string {
     </label>
     <label>收款账号标识，可空<input name="collect_account" value="${escapeAttr(config.collectAccount)}" placeholder="用于多收款账号时过滤匹配"></label>
     <label>支付宝 APP_ID，必填<input name="alipay_app_id" type="password" placeholder="${secretPlaceholder(config.alipayAppId)}"></label>
+    <input name="alipay_app_public_key_text" type="hidden" value="${escapeAttr(config.alipayAppPublicKeyText)}">
     <label>自动查账
       <select name="alipay_poll_enabled">
         <option value="false"${config.alipayPollEnabled !== "true" ? " selected" : ""}>关闭</option>
@@ -1638,7 +1646,7 @@ function settingsForm(config: AppConfig): string {
       <button type="button" onclick="generateAlipayKeyPair()">生成支付宝应用密钥对</button>
       <button type="button" onclick="copyAlipayPublicKey()">复制支付宝后台专用公钥</button>
     </div>
-    <label class="wide">支付宝后台专用应用公钥，复制到支付宝开放平台<textarea id="alipay-app-public-key-text" readonly placeholder="点击“生成支付宝应用密钥对”后这里会出现一整行公钥字符串，不含头尾和换行"></textarea></label>
+    <label class="wide">支付宝后台专用应用公钥，复制到支付宝开放平台<textarea id="alipay-app-public-key-text" readonly placeholder="点击“生成支付宝应用密钥对”后这里会出现一整行公钥字符串，不含头尾和换行">${escapeHtml(config.alipayAppPublicKeyText)}</textarea></label>
     <label class="wide">应用公钥 PEM，仅备用查看<textarea id="alipay-app-public-key-pem" readonly placeholder="这里是 PEM 格式，通常不要粘到支付宝后台"></textarea></label>
     <label class="wide">支付宝应用私钥 PEM，查账必填<textarea name="alipay_private_key_pem" placeholder="${secretPlaceholder(config.alipayPrivateKeyPem)}"></textarea></label>
     <label class="wide">支付宝公钥 PEM，通知验签用<textarea name="alipay_public_key_pem" placeholder="${secretPlaceholder(config.alipayPublicKeyPem)}"></textarea></label>
