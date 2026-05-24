@@ -8,7 +8,6 @@ on:
       - "src/**"
       - "migrations/**"
       - "package.json"
-      - "package-lock.json"
       - "tsconfig.json"
       - "wrangler.toml"
       - ".github/workflows/deploy-worker.yml"
@@ -29,11 +28,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install --no-package-lock
 
       - name: Typecheck
         run: npm run typecheck
@@ -47,7 +44,7 @@ jobs:
               throw new Error(`Missing required deployment setting: ${name}`);
             }
           }
-          const workerName = process.env.WORKER_NAME || "aepay-worker";
+          const workerName = process.env.WORKER_NAME || "aepay";
           const databaseName = process.env.D1_DATABASE_NAME || "aepay";
           const toml = `name = "${workerName}"
           main = "src/index.ts"
