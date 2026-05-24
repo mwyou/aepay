@@ -1,4 +1,4 @@
-name = "aepay-worker"
+name = "aepay"
 main = "src/index.ts"
 compatibility_date = "2026-05-23"
 
