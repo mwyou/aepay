@@ -129,6 +129,19 @@ interface SettingRow {
   updated_at: string;
 }
 
+interface AdminLoginAttemptRow {
+  id: number;
+  ip: string;
+  username: string;
+  success: number;
+  created_at: string;
+}
+
+const ADMIN_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const ADMIN_LOGIN_MAX_FAILURES = 5;
+const ADMIN_PASSWORD_HASH_PREFIX = "pbkdf2-sha256";
+const ADMIN_PASSWORD_HASH_ITERATIONS = 210_000;
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
@@ -189,6 +202,7 @@ export default {
   async scheduled(_: ScheduledController, env: Env): Promise<void> {
     const config = await loadConfig(env);
     await runAlipayPolling(env, config);
+    await retryFailedCallbacks(env, config);
   },
 };
 
@@ -317,6 +331,7 @@ async function resetSystem(request: Request, env: Env): Promise<Response> {
     : null;
 
   await env.DB.batch([
+    env.DB.prepare("DELETE FROM admin_login_attempts"),
     env.DB.prepare("DELETE FROM callback_logs"),
     env.DB.prepare("DELETE FROM payment_events"),
     env.DB.prepare("DELETE FROM alipay_transactions"),
@@ -401,6 +416,8 @@ async function createOrderRecord(env: Env, config: AppConfig, body: CreateOrderB
   assertUrl(body.notify_url, "notify_url");
   if (body.return_url) assertUrl(body.return_url, "return_url");
 
+  await expirePendingOrders(env);
+
   const existing = await findOrder(env, body.merchant_order_no);
   if (existing) throw new HttpError(409, "merchant_order_no already exists");
 
@@ -443,12 +460,14 @@ async function createOrderRecord(env: Env, config: AppConfig, body: CreateOrderB
 }
 
 async function getOrder(merchantOrderNo: string, env: Env, config: AppConfig, requestUrl: string): Promise<Response> {
+  await expirePendingOrders(env);
   const order = await findOrder(env, decodeURIComponent(merchantOrderNo));
   if (!order) return json({ detail: "Order not found" }, 404);
   return json(orderResponse(config, order, requestUrl));
 }
 
 async function paymentPage(merchantOrderNo: string, env: Env, config: AppConfig): Promise<Response> {
+  await expirePendingOrders(env);
   const order = await findOrder(env, decodeURIComponent(merchantOrderNo));
   if (!order) return html("<h1>订单不存在</h1>", 404);
   return html(renderPaymentPage(config, order));
@@ -511,6 +530,7 @@ async function createEpayOrder(request: Request, env: Env, config: AppConfig, pa
   const returnUrl = params.return_url ?? "";
   const payType = params.type ?? "alipay";
   const name = params.name ?? "";
+  assertMoney(money, "money");
   if (payType !== "alipay") throw new HttpError(400, "only alipay type is supported");
   const existing = await findOrder(env, outTradeNo);
   if (existing) {
@@ -564,6 +584,7 @@ async function alipayNotify(request: Request, env: Env, config: AppConfig): Prom
   if (verifyRequired && !(await verifyAlipayRsa2(params, config.alipayPublicKeyPem))) {
     return text("invalid-signature", 400);
   }
+  assertAlipayNotifyContext(params, config);
 
   const tradeStatus = params.trade_status ?? "";
   if (!["TRADE_SUCCESS", "TRADE_FINISHED"].includes(tradeStatus)) return text("success");
@@ -571,6 +592,12 @@ async function alipayNotify(request: Request, env: Env, config: AppConfig): Prom
   const amount = params.total_amount ?? "";
   const paidAt = parseAlipayTime(params.gmt_payment ?? "");
   if (!tradeNo || !amount || !paidAt) return text("missing-fields", 400);
+
+  const existingEvent = await env.DB.prepare(
+    "SELECT id FROM payment_events WHERE provider = 'alipay' AND provider_trade_no = ?",
+  )
+    .bind(tradeNo)
+    .first<{ id: number }>();
 
   const result = await recordPaymentEvent(
     env,
@@ -584,7 +611,7 @@ async function alipayNotify(request: Request, env: Env, config: AppConfig): Prom
     },
     params,
   );
-  if (result.order) await dispatchCallback(env, config, result.order);
+  if (result.order && !existingEvent) await dispatchCallback(env, config, result.order);
   return text("success");
 }
 
@@ -602,13 +629,13 @@ async function runAlipayPolling(
   const windowMinutes = numberEnv(config.alipayPollWindowMinutes, 10);
   const windowEnd = startedAt;
   const windowStart = new Date(windowEnd.getTime() - windowMinutes * 60_000);
-  const runId = await createPollingRun(env, "running", startedAt, windowStart, windowEnd);
+  let runId = 0;
 
   try {
     if (config.alipayPollEnabled !== "true" && !force) {
-      await finishPollingRun(env, runId, "skipped", 0, 0, "自动查账未开启");
       return { status: "skipped", fetched_count: 0, matched_count: 0, error: "自动查账未开启" };
     }
+    runId = await createPollingRun(env, "running", startedAt, windowStart, windowEnd);
     if (!config.alipayAppId || !config.alipayPrivateKeyPem) {
       throw new Error("支付宝查账未配置完整：APP_ID 和应用私钥都必填");
     }
@@ -888,13 +915,16 @@ async function recordPaymentEvent(
 
   const order = await matchPendingOrder(env, config, event);
   if (order) {
-    await env.DB.prepare(
+    const updateResult = await env.DB.prepare(
       `UPDATE orders
        SET status = 'paid', alipay_trade_no = ?, paid_at = ?, updated_at = ?
        WHERE id = ? AND status = 'pending'`,
     )
       .bind(event.provider_trade_no, event.paid_at, now, order.id)
       .run();
+    if ((updateResult.meta?.changes ?? 0) === 0) {
+      return { event, order: null };
+    }
     await env.DB.prepare("UPDATE payment_events SET matched_order_id = ? WHERE id = ?")
       .bind(order.id, event.id)
       .run();
@@ -909,15 +939,22 @@ async function recordPaymentEvent(
 }
 
 async function matchPendingOrder(env: Env, config: AppConfig, event: PaymentEventRow): Promise<OrderRow | null> {
+  await expirePendingOrders(env, event.paid_at);
   let query =
     "SELECT * FROM orders WHERE status = 'pending' AND pay_amount = ? AND created_at <= ? AND expires_at >= ?";
   const args: unknown[] = [event.amount, event.paid_at, event.paid_at];
-  if (config.collectAccount) {
+  if (event.collect_account) {
     query += " AND collect_account = ?";
-    args.push(config.collectAccount);
+    args.push(event.collect_account);
   }
   query += " ORDER BY created_at ASC LIMIT 1";
   return env.DB.prepare(query).bind(...args).first<OrderRow>();
+}
+
+async function expirePendingOrders(env: Env, nowIso = new Date().toISOString()): Promise<void> {
+  await env.DB.prepare("UPDATE orders SET status = 'expired', updated_at = ? WHERE status = 'pending' AND expires_at < ?")
+    .bind(nowIso, nowIso)
+    .run();
 }
 
 async function dispatchCallback(env: Env, config: AppConfig, order: OrderRow): Promise<void> {
@@ -932,28 +969,50 @@ async function dispatchCallback(env: Env, config: AppConfig, order: OrderRow): P
     .first<{ id: number }>();
   if (!inserted) return;
 
+  await sendCallbackAttempt(env, inserted.id, order.notify_url, callback.body, callback.headers);
+}
+
+async function retryFailedCallbacks(env: Env, config: AppConfig): Promise<void> {
+  const rows = await env.DB.prepare(
+    "SELECT * FROM callback_logs WHERE status = 'failed' AND attempts < 5 ORDER BY updated_at ASC LIMIT 20",
+  ).all<CallbackLogRow>();
+  for (const row of rows.results) {
+    const order = await findOrderById(env, row.order_id);
+    if (!order || order.status !== "paid") continue;
+    const callback = await buildCallback(config, order);
+    await sendCallbackAttempt(env, row.id, order.notify_url, callback.body, callback.headers);
+  }
+}
+
+async function sendCallbackAttempt(
+  env: Env,
+  logId: number,
+  notifyUrl: string,
+  body: string,
+  headers: HeadersInit,
+): Promise<void> {
   let status = "failed";
   let responseStatus: number | null = null;
   let responseBody = "";
   try {
-    const response = await fetch(order.notify_url, {
+    const response = await fetch(notifyUrl, {
       method: "POST",
-      headers: callback.headers,
-      body: callback.body,
+      headers,
+      body,
     });
     responseStatus = response.status;
     responseBody = (await response.text()).slice(0, 2000);
-    status = response.ok ? "success" : "failed";
+    status = response.ok && responseBody.trim().toLowerCase() === "success" ? "success" : "failed";
   } catch (error) {
     responseBody = error instanceof Error ? error.message : "callback failed";
   }
 
   await env.DB.prepare(
     `UPDATE callback_logs
-     SET status = ?, response_status = ?, response_body = ?, attempts = attempts + 1, updated_at = ?
+     SET status = ?, request_body = ?, response_status = ?, response_body = ?, attempts = attempts + 1, updated_at = ?
      WHERE id = ?`,
   )
-    .bind(status, responseStatus, responseBody, new Date().toISOString(), inserted.id)
+    .bind(status, body, responseStatus, responseBody, new Date().toISOString(), logId)
     .run();
 }
 
@@ -996,6 +1055,7 @@ async function buildCallback(config: AppConfig, order: OrderRow): Promise<{ body
 }
 
 async function adminPage(env: Env, config: AppConfig): Promise<Response> {
+  await expirePendingOrders(env);
   const [orders, events, callbacks, pollingRuns] = await Promise.all([
     env.DB.prepare("SELECT * FROM orders ORDER BY id DESC LIMIT 50").all<OrderRow>(),
     env.DB.prepare("SELECT * FROM payment_events ORDER BY id DESC LIMIT 30").all<PaymentEventRow>(),
@@ -1006,6 +1066,7 @@ async function adminPage(env: Env, config: AppConfig): Promise<Response> {
 }
 
 async function adminOrders(env: Env): Promise<Response> {
+  await expirePendingOrders(env);
   const rows = await env.DB.prepare("SELECT * FROM orders ORDER BY id DESC LIMIT 100").all<OrderRow>();
   return json({ orders: rows.results });
 }
@@ -1065,7 +1126,14 @@ async function adminLogin(request: Request, env: Env, config: AppConfig): Promis
   const form = await request.formData();
   const username = stringForm(form, "username");
   const password = stringForm(form, "password");
-  if (!(await verifyAdminPassword(env, config, username, password))) {
+  const ip = clientIp(request);
+  if (await adminLoginLocked(env, ip, username)) {
+    await logAdminLoginAttempt(env, ip, username, false);
+    return new Response("登录失败次数过多，请 15 分钟后再试", { status: 429 });
+  }
+  const verified = await verifyAdminPassword(env, config, username, password);
+  await logAdminLoginAttempt(env, ip, username, verified);
+  if (!verified) {
     return Response.redirect(new URL("/admin/login?error=1", request.url), 302);
   }
   return new Response(null, {
@@ -1092,9 +1160,10 @@ async function adminSetup(request: Request, env: Env, config: AppConfig): Promis
   if (password.length < 8) throw new HttpError(400, "password must be at least 8 characters");
   if (password !== confirm) throw new HttpError(400, "password confirmation does not match");
   const now = new Date().toISOString();
+  const passwordHash = await adminPasswordHash(username, password);
   await upsertSetting(env, "admin_username", username, true, now);
-  await upsertSetting(env, "admin_password_hash", await adminPasswordHash(username, password), true, now);
-  const nextConfig = { ...config, adminUsername: username, adminPasswordHash: await adminPasswordHash(username, password) };
+  await upsertSetting(env, "admin_password_hash", passwordHash, true, now);
+  const nextConfig = { ...config, adminUsername: username, adminPasswordHash: passwordHash };
   return new Response(null, {
     status: 302,
     headers: {
@@ -1118,7 +1187,7 @@ function adminLogout(request: Request): Response {
 async function verifyAdminPassword(env: Env, config: AppConfig, username: string, password: string): Promise<boolean> {
   if (!username || !password || username !== config.adminUsername) return false;
   if (!config.adminPasswordHash) return false;
-  return timingSafeEqual(await adminPasswordHash(username, password), config.adminPasswordHash);
+  return verifyAdminPasswordHash(config.adminPasswordHash, username, password);
 }
 
 async function verifyAdminSession(request: Request, env: Env, config: AppConfig): Promise<boolean> {
@@ -1128,8 +1197,12 @@ async function verifyAdminSession(request: Request, env: Env, config: AppConfig)
   if (!payload64 || !signature) return false;
   const expected = await hmacSha256(adminSessionSecret(env, config), payload64);
   if (!timingSafeEqual(signature, expected.slice("sha256=".length))) return false;
-  const payload = JSON.parse(atobUrl(payload64)) as { u?: string; exp?: number };
-  return payload.u === config.adminUsername && typeof payload.exp === "number" && payload.exp > Math.floor(Date.now() / 1000);
+  try {
+    const payload = JSON.parse(atobUrl(payload64)) as { u?: string; exp?: number };
+    return payload.u === config.adminUsername && typeof payload.exp === "number" && payload.exp > Math.floor(Date.now() / 1000);
+  } catch {
+    return false;
+  }
 }
 
 async function adminCookie(request: Request, env: Env, config: AppConfig, username: string): Promise<string> {
@@ -1144,7 +1217,105 @@ function adminSessionSecret(env: Env, config: AppConfig): string {
 }
 
 async function adminPasswordHash(username: string, password: string): Promise<string> {
-  return sha256Hex(`aepay-admin-v1:${username}:${password}`);
+  const salt = randomHex(16);
+  const hash = await pbkdf2Hex(password, salt, ADMIN_PASSWORD_HASH_ITERATIONS);
+  return `${ADMIN_PASSWORD_HASH_PREFIX}:${ADMIN_PASSWORD_HASH_ITERATIONS}:${salt}:${hash}`;
+}
+
+async function verifyAdminPasswordHash(storedHash: string, username: string, password: string): Promise<boolean> {
+  const parsed = parseAdminPasswordHash(storedHash);
+  if (parsed) {
+    const hash = await pbkdf2Hex(password, parsed.salt, parsed.iterations);
+    return timingSafeEqual(hash, parsed.hash);
+  }
+  return timingSafeEqual(await sha256Hex(`aepay-admin-v1:${username}:${password}`), storedHash);
+}
+
+function parseAdminPasswordHash(value: string): { iterations: number; salt: string; hash: string } | null {
+  const parts = value.split(":");
+  if (parts.length !== 4 || parts[0] !== ADMIN_PASSWORD_HASH_PREFIX) return null;
+  const iterations = Number(parts[1]);
+  if (!Number.isInteger(iterations) || iterations <= 0) return null;
+  if (parts[2].length % 2 !== 0 || parts[3].length % 2 !== 0) return null;
+  if (!/^[0-9a-f]+$/i.test(parts[2]) || !/^[0-9a-f]+$/i.test(parts[3])) return null;
+  return { iterations, salt: parts[2], hash: parts[3] };
+}
+
+async function pbkdf2Hex(password: string, saltHex: string, iterations: number): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: hexToArrayBuffer(saltHex),
+      iterations,
+      hash: "SHA-256",
+    },
+    key,
+    256,
+  );
+  return hex(bits);
+}
+
+function randomHex(length: number): string {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  return hex(bytes.buffer);
+}
+
+function hexToArrayBuffer(value: string): ArrayBuffer {
+  const clean = value.trim();
+  const bytes = new Uint8Array(Math.floor(clean.length / 2));
+  for (let i = 0; i < bytes.length; i += 1) {
+    bytes[i] = Number.parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes.buffer;
+}
+
+function clientIp(request: Request): string {
+  const forwarded = request.headers.get("x-forwarded-for") ?? "";
+  const connectingIp = request.headers.get("cf-connecting-ip") ?? "";
+  const realIp = request.headers.get("x-real-ip") ?? "";
+  return [connectingIp, forwarded.split(",")[0] ?? "", realIp].map((value) => value.trim()).find(Boolean) ?? "";
+}
+
+async function adminLoginLocked(env: Env, ip: string, username: string): Promise<boolean> {
+  const cutoff = new Date(Date.now() - ADMIN_LOGIN_WINDOW_MS).toISOString();
+  const clauses = ["success = 0", "created_at >= ?"];
+  const args: unknown[] = [cutoff];
+  const filters: string[] = [];
+  if (ip) {
+    filters.push("ip = ?");
+    args.push(ip);
+  }
+  if (username) {
+    filters.push("username = ?");
+    args.push(username);
+  }
+  if (filters.length > 0) clauses.push(`(${filters.join(" OR ")})`);
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS count FROM admin_login_attempts WHERE ${clauses.join(" AND ")}`,
+  )
+    .bind(...args)
+    .first<{ count: number }>();
+  return (row?.count ?? 0) >= ADMIN_LOGIN_MAX_FAILURES;
+}
+
+async function logAdminLoginAttempt(env: Env, ip: string, username: string, success: boolean): Promise<void> {
+  const now = new Date().toISOString();
+  const purgeBefore = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM admin_login_attempts WHERE created_at < ?").bind(purgeBefore),
+    env.DB.prepare(
+      `INSERT INTO admin_login_attempts (ip, username, success, created_at)
+       VALUES (?, ?, ?, ?)`,
+    ).bind(ip, username, success ? 1 : 0, now),
+  ]);
 }
 
 function btoaUrl(value: string): string {
@@ -1180,7 +1351,11 @@ async function requestParams(request: Request): Promise<Record<string, string>> 
   if (request.method === "POST") {
     const contentType = request.headers.get("content-type") ?? "";
     if (contentType.includes("application/json")) {
-      Object.assign(params, (await request.json()) as Record<string, string>);
+      try {
+        Object.assign(params, (await request.json()) as Record<string, string>);
+      } catch {
+        throw new HttpError(400, "Invalid JSON body");
+      }
     } else {
       const form = await request.formData();
       Object.assign(params, formToRecord(form));
@@ -1454,10 +1629,27 @@ function renderAdmin(
     input, select, textarea { width:100%; min-height:38px; border:1px solid var(--line); border-radius:6px; padding:0 10px; font:inherit; color:var(--text); background:#fff; }
     textarea { min-height:96px; padding:10px; resize:vertical; }
     button { height:38px; border:0; border-radius:6px; background:var(--brand); color:white; padding:0 14px; font-weight:600; cursor:pointer; }
+    button:disabled { opacity:.65; cursor:not-allowed; }
     .note { padding:0 16px 16px; color:var(--muted); }
     .wide { grid-column:1 / -1; }
     .settings-form .note { padding:0; align-self:center; }
-    @media (max-width: 850px) { form, .settings-form { grid-template-columns:1fr; } .bar { align-items:flex-start; flex-direction:column; } }
+    .action-status { min-height:22px; color:var(--ok); font-weight:650; }
+    .action-status.error { color:var(--bad); }
+    .payment-preview-grid { grid-column:1 / -1; display:grid; grid-template-columns:minmax(220px,300px) minmax(280px,1fr); gap:14px; align-items:start; margin-top:6px; }
+    .preview-card { border:1px solid var(--line); border-radius:10px; background:#fff; padding:14px; display:grid; gap:10px; }
+    .preview-card strong { color:var(--text); }
+    .saved-qr-frame, .preview-qr-frame { min-height:188px; border:1px dashed var(--line); border-radius:10px; background:#fafbfc; display:grid; place-items:center; padding:12px; color:var(--muted); text-align:center; }
+    .saved-qr-frame img, .preview-qr-frame img { width:min(180px,100%); aspect-ratio:1; object-fit:contain; border-radius:8px; background:#fff; }
+    .pay-preview-canvas { border-radius:12px; padding:18px; background:var(--preview-bg); display:grid; place-items:center; }
+    .pay-preview-phone { width:min(350px,100%); border:1px solid var(--preview-line); border-radius:var(--preview-radius); padding:18px; text-align:center; background:var(--preview-panel); color:var(--preview-text); box-shadow:var(--preview-shadow); }
+    .pay-preview-mark { width:42px; height:42px; margin:0 auto 10px; border-radius:12px; display:grid; place-items:center; background:var(--preview-brand); color:#fff; font-size:22px; font-weight:850; }
+    .pay-preview-phone h3 { margin:0 0 8px; font-size:18px; }
+    .pay-preview-amount { margin:6px 0 12px; color:var(--preview-accent); font-size:36px; font-weight:850; }
+    .pay-preview-timer { margin:0 0 12px; min-height:30px; display:flex; align-items:center; justify-content:center; border:1px solid var(--preview-line); border-radius:var(--preview-radius); color:var(--preview-muted); font-weight:700; background:rgba(255,255,255,.35); }
+    .pay-preview-meta { margin-top:12px; display:grid; gap:6px; color:var(--preview-muted); font-size:12px; text-align:left; }
+    .pay-preview-meta div { display:flex; justify-content:space-between; gap:10px; border-bottom:1px solid var(--preview-line); padding-bottom:6px; }
+    .pay-preview-meta div:last-child { border-bottom:0; padding-bottom:0; }
+    @media (max-width: 850px) { form, .settings-form, .payment-preview-grid { grid-template-columns:1fr; } .bar { align-items:flex-start; flex-direction:column; } }
   </style>
 </head>
 <body>
@@ -1552,15 +1744,39 @@ function renderAdmin(
       crypto.getRandomValues(bytes);
       const value = Array.from(bytes, byte => alphabet[byte % alphabet.length]).join('');
       const input = document.querySelector('[name="' + name + '"]');
-      if (input) input.value = value;
+      if (input) {
+        input.value = value;
+        const target = name === 'epay_key' ? 'epay-action-status' : 'system-action-status';
+        const label = name === 'callback_secret' ? '回调 HMAC 密钥' : name === 'merchant_api_key' ? '商户 API Key' : '易支付 Key';
+        showStatus(target, label + '已生成，点击“保存设置”后生效。');
+      }
+    }
+    function showStatus(id, message, isError) {
+      const target = document.querySelector('#' + id);
+      if (!target) return;
+      target.textContent = message;
+      target.classList.toggle('error', Boolean(isError));
     }
     async function copyText(value) {
       if (!value) {
         alert('还没有可复制的值');
         return;
       }
-      await navigator.clipboard.writeText(value);
-      alert('已复制');
+      try {
+        await navigator.clipboard.writeText(value);
+        alert('已复制');
+      } catch {
+        window.prompt('浏览器拦截了自动复制，请手动复制：', value);
+      }
+    }
+    function base64FromArrayBuffer(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      const chunkSize = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+      }
+      return btoa(binary);
     }
     function pemFromBase64(base64, type) {
       const lines = base64.match(/.{1,64}/g) || [];
@@ -1577,29 +1793,41 @@ function renderAdmin(
       return value.length <= 10 ? value : value.slice(0, 4) + '...' + value.slice(-4);
     }
     async function generateAlipayKeyPair() {
-      const pair = await crypto.subtle.generateKey(
-        {
-          name: 'RSASSA-PKCS1-v1_5',
-          modulusLength: 2048,
-          publicExponent: new Uint8Array([1, 0, 1]),
-          hash: 'SHA-256'
-        },
-        true,
-        ['sign', 'verify']
-      );
-      const privateKey = await crypto.subtle.exportKey('pkcs8', pair.privateKey);
-      const publicKey = await crypto.subtle.exportKey('spki', pair.publicKey);
-      const privatePem = pemFromBase64(btoa(String.fromCharCode(...new Uint8Array(privateKey))), 'PRIVATE KEY');
-      const publicPem = pemFromBase64(btoa(String.fromCharCode(...new Uint8Array(publicKey))), 'PUBLIC KEY');
-      const privateInput = document.querySelector('[name="alipay_private_key_pem"]');
-      const privatePreview = document.querySelector('#alipay-app-private-key-preview');
-      const publicHidden = document.querySelector('[name="alipay_app_public_key_text"]');
-      const publicPreview = document.querySelector('#alipay-app-public-key-preview');
-      const publicText = alipayPublicKeyText(publicPem);
-      if (privateInput) privateInput.value = privatePem;
-      if (privatePreview) privatePreview.textContent = previewSecretText(alipayPrivateKeyText(privatePem));
-      if (publicHidden) publicHidden.value = publicText;
-      if (publicPreview) publicPreview.textContent = previewSecretText(publicText);
+      const button = document.querySelector('#generate-alipay-key-button');
+      try {
+        if (!window.crypto || !crypto.subtle) throw new Error('当前浏览器不支持 WebCrypto，请用 HTTPS 页面或新版浏览器打开后台');
+        if (button) button.disabled = true;
+        showStatus('alipay-key-status', '正在生成密钥对，稍等几秒...');
+        const pair = await crypto.subtle.generateKey(
+          {
+            name: 'RSASSA-PKCS1-v1_5',
+            modulusLength: 2048,
+            publicExponent: new Uint8Array([1, 0, 1]),
+            hash: 'SHA-256'
+          },
+          true,
+          ['sign', 'verify']
+        );
+        const privateKey = await crypto.subtle.exportKey('pkcs8', pair.privateKey);
+        const publicKey = await crypto.subtle.exportKey('spki', pair.publicKey);
+        const privatePem = pemFromBase64(base64FromArrayBuffer(privateKey), 'PRIVATE KEY');
+        const publicPem = pemFromBase64(base64FromArrayBuffer(publicKey), 'PUBLIC KEY');
+        const privateInput = document.querySelector('[name="alipay_private_key_pem"]');
+        const privatePreview = document.querySelector('#alipay-app-private-key-preview');
+        const publicHidden = document.querySelector('[name="alipay_app_public_key_text"]');
+        const publicPreview = document.querySelector('#alipay-app-public-key-preview');
+        const publicText = alipayPublicKeyText(publicPem);
+        if (privateInput) privateInput.value = privatePem;
+        if (privatePreview) privatePreview.textContent = previewSecretText(alipayPrivateKeyText(privatePem));
+        if (publicHidden) publicHidden.value = publicText;
+        if (publicPreview) publicPreview.textContent = previewSecretText(publicText);
+        showStatus('alipay-key-status', '密钥对已生成：私钥已填入本页，应用公钥已准备好复制；点击“保存设置”后生效。');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '生成失败';
+        showStatus('alipay-key-status', message, true);
+      } finally {
+        if (button) button.disabled = false;
+      }
     }
     async function copyAlipayPublicKey() {
       const output = document.querySelector('[name="alipay_app_public_key_text"]');
@@ -1607,8 +1835,77 @@ function renderAdmin(
         alert('请先生成支付宝应用密钥对');
         return;
       }
-      await navigator.clipboard.writeText(output.value);
-      alert('已复制支付宝后台专用应用公钥字符串');
+      try {
+        await navigator.clipboard.writeText(output.value);
+        alert('已复制支付宝后台专用应用公钥字符串');
+      } catch {
+        window.prompt('浏览器拦截了自动复制，请手动复制：', output.value);
+      }
+    }
+    const paymentPreviewThemes = {
+      minimal: { bg:'#f6f8fb', panel:'#ffffff', text:'#1f2937', muted:'#667085', line:'#dfe5ee', brand:'#102a43', accent:'#2563eb', radius:'8px', shadow:'0 12px 40px rgba(15,23,42,.08)' },
+      alipay: { bg:'#eaf4ff', panel:'#ffffff', text:'#132238', muted:'#5b6b80', line:'#cfe2f7', brand:'#1677ff', accent:'#1677ff', radius:'8px', shadow:'0 18px 50px rgba(22,119,255,.18)' },
+      dark: { bg:'#101418', panel:'#171d23', text:'#eef4f8', muted:'#a9b4bf', line:'#2b3640', brand:'#22c55e', accent:'#38bdf8', radius:'8px', shadow:'0 18px 60px rgba(0,0,0,.35)' },
+      warm: { bg:'#f8f1e8', panel:'#fffdf9', text:'#2b2118', muted:'#7a6a5a', line:'#eadfcc', brand:'#b45309', accent:'#c2410c', radius:'8px', shadow:'0 18px 46px rgba(120,80,30,.14)' }
+    };
+    function setPaymentPreviewTheme(name) {
+      const theme = paymentPreviewThemes[name] || paymentPreviewThemes.alipay;
+      const preview = document.querySelector('#payment-page-preview');
+      if (!preview) return;
+      Object.entries(theme).forEach(([key, value]) => {
+        preview.style.setProperty('--preview-' + key, value);
+      });
+    }
+    function setPaymentPreviewQr(src) {
+      document.querySelectorAll('[data-payment-qr-target]').forEach(target => {
+        target.textContent = '';
+        if (!src) {
+          const empty = document.createElement('div');
+          empty.textContent = '未配置收款码';
+          target.appendChild(empty);
+          return;
+        }
+        const image = document.createElement('img');
+        image.src = src;
+        image.alt = '收款码预览';
+        target.appendChild(image);
+      });
+    }
+    function initPaymentPreviewControls() {
+      const fileInput = document.querySelector('[name="collect_qr_image_file"]');
+      const urlInput = document.querySelector('[name="collect_qr_image_url"]');
+      const themeInput = document.querySelector('[name="payment_page_theme"]');
+      const savedQr = ${JSON.stringify(config.collectQrImageUrl)};
+      if (fileInput) {
+        fileInput.addEventListener('change', () => {
+          const file = fileInput.files && fileInput.files[0];
+          if (!file) {
+            setPaymentPreviewQr(urlInput && urlInput.value.trim() ? urlInput.value.trim() : savedQr);
+            showStatus('payment-preview-status', savedQr ? '当前展示的是已保存收款码。' : '还没有选择新图片。');
+            return;
+          }
+          if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+            showStatus('payment-preview-status', '只支持 PNG、JPG 或 WebP 图片。', true);
+            return;
+          }
+          const reader = new FileReader();
+          reader.onload = () => {
+            setPaymentPreviewQr(String(reader.result || ''));
+            showStatus('payment-preview-status', '正在预览新图片；点击“保存设置”后才会正式生效。');
+          };
+          reader.readAsDataURL(file);
+        });
+      }
+      if (urlInput) {
+        urlInput.addEventListener('input', () => {
+          const value = urlInput.value.trim();
+          setPaymentPreviewQr(value || savedQr);
+          showStatus('payment-preview-status', value ? '正在预览新的图片 URL；点击“保存设置”后才会正式生效。' : savedQr ? '当前展示的是已保存收款码。' : '还没有配置收款码。');
+        });
+      }
+      if (themeInput) {
+        themeInput.addEventListener('change', () => setPaymentPreviewTheme(themeInput.value));
+      }
     }
     async function resetSystem() {
       const confirmInput = document.querySelector('#reset-confirm');
@@ -1631,6 +1928,7 @@ function renderAdmin(
       if (!res.ok) alert(text);
       else location.reload();
     }
+    initPaymentPreviewControls();
   </script>
 </body>
 </html>`;
@@ -1660,6 +1958,7 @@ function settingsForm(config: AppConfig): string {
       <button type="button" onclick="fillSecret('callback_secret')">生成回调 HMAC 密钥</button>
       <button type="button" onclick="fillSecret('merchant_api_key')">生成商户 API Key</button>
     </div>
+    <div id="system-action-status" class="action-status wide"></div>
     <div class="wide" style="border:1px solid #f3b4ad; border-radius:8px; padding:14px; background:#fff7f6; display:grid; gap:10px;">
       <strong style="color:#b42318;">危险操作</strong>
       <div class="note" style="padding:0;">重置会清空订单、到账事件、支付宝流水、查账日志、回调日志，并恢复所有业务配置默认值。默认保留当前管理员账号。</div>
@@ -1679,11 +1978,12 @@ function settingsForm(config: AppConfig): string {
     <div class="wide" style="display:flex; flex-wrap:wrap; gap:10px;">
       <button type="button" onclick="fillSecret('epay_key')">生成易支付 Key</button>
     </div>
+    <div id="epay-action-status" class="action-status wide"></div>
     </div>
 
     <div class="panel" data-panel="payment" hidden style="display:contents;">
     <div class="note wide" style="padding:0;">支付页设置只影响用户扫码付款页面，不影响支付宝开放平台查账。</div>
-    <label>收款码图片，必填<input name="collect_qr_image_file" type="file" accept="image/png,image/jpeg,image/webp"></label>
+    <label>上传新收款码图片，可选<input name="collect_qr_image_file" type="file" accept="image/png,image/jpeg,image/webp"></label>
     <label>收款码图片 URL，已有图床才填<input name="collect_qr_image_url" value="${config.collectQrImageUrl.startsWith("data:image/") ? "" : escapeAttr(config.collectQrImageUrl)}" placeholder="${config.collectQrImageUrl ? "已配置，上传新图片或填新 URL 可替换" : "https://.../alipay-qr.png"}"></label>
     <label>支付页主题
       <select name="payment_page_theme">
@@ -1693,6 +1993,8 @@ function settingsForm(config: AppConfig): string {
         ${paymentThemeOption(config.paymentPageTheme, "warm", "暖色")}
       </select>
     </label>
+    <div id="payment-preview-status" class="action-status wide">${config.collectQrImageUrl ? "已保存收款码，文件框刷新后显示未选择是浏览器限制。" : "还没有配置收款码，上传图片或填写 URL 后可在下方预览。"}</div>
+    ${paymentSettingsPreview(config)}
     </div>
 
     <div class="panel" data-panel="alipay" hidden style="display:contents;">
@@ -1717,9 +2019,10 @@ function settingsForm(config: AppConfig): string {
       </select>
     </label>
     <div class="wide" style="display:flex; flex-wrap:wrap; gap:10px;">
-      <button type="button" onclick="generateAlipayKeyPair()">生成支付宝应用密钥对</button>
+      <button id="generate-alipay-key-button" type="button" onclick="generateAlipayKeyPair()">生成支付宝应用密钥对</button>
       <button type="button" onclick="copyAlipayPublicKey()">复制支付宝后台专用公钥</button>
     </div>
+    <div id="alipay-key-status" class="action-status wide"></div>
     <div class="note wide" style="padding:0;">当前应用私钥：<span id="alipay-app-private-key-preview">${secretPreview(alipayPrivateKeyText(config.alipayPrivateKeyPem))}</span></div>
     <input name="alipay_private_key_pem" type="hidden" value="">
     <div class="note wide" style="padding:0;">当前应用公钥：<span id="alipay-app-public-key-preview">${secretPreview(config.alipayAppPublicKeyText)}</span> ${config.alipayAppPublicKeyText ? `<button type="button" onclick="copyAlipayPublicKey()">复制应用公钥</button>` : ""}</div>
@@ -1731,6 +2034,53 @@ function settingsForm(config: AppConfig): string {
     <button type="submit">保存设置</button>
     <div class="note wide">密钥类字段留空表示不修改；易支付接入只需要配置易支付 PID 和易支付 Key。商户 API Key 只给直接调用 /api/orders 的程序用。</div>
   </form>`;
+}
+
+function paymentSettingsPreview(config: AppConfig): string {
+  const theme = paymentTheme(config.paymentPageTheme);
+  const previewStyle = [
+    `--preview-bg:${theme.bg}`,
+    `--preview-panel:${theme.panel}`,
+    `--preview-text:${theme.text}`,
+    `--preview-muted:${theme.muted}`,
+    `--preview-line:${theme.line}`,
+    `--preview-brand:${theme.brand}`,
+    `--preview-accent:${theme.accent}`,
+    `--preview-radius:${theme.radius}`,
+    `--preview-shadow:${theme.shadow}`,
+  ].join(";");
+  const qrPreview = paymentQrPreview(config.collectQrImageUrl);
+  return `<div class="payment-preview-grid">
+    <div class="preview-card">
+      <strong>当前收款码</strong>
+      <div class="saved-qr-frame" data-payment-qr-target>${qrPreview}</div>
+      <div class="note" style="padding:0;">保存后文件选择框会重新显示“未选择文件”，请以下方预览判断当前配置。</div>
+    </div>
+    <div class="preview-card">
+      <strong>支付页预览</strong>
+      <div id="payment-page-preview" class="pay-preview-canvas" style="${escapeAttr(previewStyle)}">
+        <div class="pay-preview-phone">
+          <div class="pay-preview-mark">支</div>
+          <h3>支付宝扫码付款</h3>
+          <div class="pay-preview-amount">¥9.91</div>
+          <div class="pay-preview-timer">剩余支付时间 <strong style="margin-left:6px;color:var(--preview-accent);">14:59</strong></div>
+          <div class="preview-qr-frame" data-payment-qr-target>${qrPreview}</div>
+          <p style="margin:10px 0 0;color:var(--preview-muted);font-size:13px;">请按页面金额付款，付款后将自动确认。</p>
+          <div class="pay-preview-meta">
+            <div><span>订单号</span><strong>PREVIEW-ORDER</strong></div>
+            <div><span>商品</span><strong>支付页预览</strong></div>
+            <div><span>状态</span><strong>pending</strong></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function paymentQrPreview(src: string): string {
+  return src
+    ? `<img src="${escapeAttr(src)}" alt="收款码预览">`
+    : `<div>未配置收款码</div>`;
 }
 
 function loginPage(config: AppConfig, hasError: boolean): string {
@@ -1823,7 +2173,7 @@ function alipayPrivateKeyText(value: string): string {
 }
 
 function escapeJs(value: string): string {
-  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
+  return escapeAttr(value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, ""));
 }
 
 function timeZoneOption(current: string, value: string, label: string): string {
@@ -1833,6 +2183,8 @@ function timeZoneOption(current: string, value: string, label: string): string {
 function paymentThemeOption(current: string, value: string, label: string): string {
   return `<option value="${escapeAttr(value)}"${current === value ? " selected" : ""}>${escapeHtml(label)}</option>`;
 }
+
+type TableCell = string | { html: string };
 
 function ordersTable(rows: OrderRow[], timeZone: string): string {
   return table(
@@ -1885,25 +2237,29 @@ function pollingRunsTable(rows: PollingRunRow[], timeZone: string): string {
       `${shortDate(row.window_start, timeZone)} - ${shortDate(row.window_end, timeZone)}`,
       String(row.fetched_count),
       String(row.matched_count),
-      row.error ? escapeHtml(row.error) : "-",
+      row.error || "-",
       shortDate(row.started_at, timeZone),
     ]),
   );
 }
 
-function table(headers: string[], rows: string[][]): string {
+function table(headers: string[], rows: TableCell[][]): string {
   const head = headers.map((header) => `<th>${escapeHtml(header)}</th>`).join("");
   const body =
     rows.length > 0
       ? rows
-          .map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`)
+          .map((row) => `<tr>${row.map((cell) => `<td>${tableCell(cell)}</td>`).join("")}</tr>`)
           .join("")
       : `<tr><td colspan="${headers.length}">暂无数据</td></tr>`;
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
-function statusPill(status: string): string {
-  return `<span class="pill ${escapeHtml(status)}">${escapeHtml(status)}</span>`;
+function tableCell(cell: TableCell): string {
+  return typeof cell === "string" ? escapeHtml(cell) : cell.html;
+}
+
+function statusPill(status: string): TableCell {
+  return { html: `<span class="pill ${escapeHtml(status)}">${escapeHtml(status)}</span>` };
 }
 
 function publicHome(config: AppConfig): string {
@@ -2124,7 +2480,7 @@ async function readJson<T>(request: Request): Promise<T> {
   try {
     return (await request.json()) as T;
   } catch {
-    throw new Error("Invalid JSON body");
+    throw new HttpError(400, "Invalid JSON body");
   }
 }
 
@@ -2138,39 +2494,52 @@ function formToRecord(form: FormData): Record<string, string> {
 
 function parseAlipayTime(value: string): string {
   if (!value) return "";
-  return normalizeDate(value.replace(" ", "T") + "+08:00", "gmt_payment");
+  try {
+    return normalizeDate(value.replace(" ", "T") + "+08:00", "gmt_payment");
+  } catch {
+    return "";
+  }
+}
+
+function assertAlipayNotifyContext(params: Record<string, string>, config: AppConfig): void {
+  if (config.alipayAppId && params.app_id && params.app_id !== config.alipayAppId) {
+    throw new HttpError(400, "invalid app_id");
+  }
+  if (config.collectAccount && params.seller_id && params.seller_id !== config.collectAccount) {
+    throw new HttpError(400, "invalid seller_id");
+  }
 }
 
 function normalizeDate(value: string, field: string): string {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) throw new Error(`${field} must be a valid date`);
+  if (Number.isNaN(date.getTime())) throw new HttpError(400, `${field} must be a valid date`);
   return date.toISOString();
 }
 
 function assertText(value: string, field: string): void {
-  if (typeof value !== "string" || value.trim() === "") throw new Error(`${field} is required`);
+  if (typeof value !== "string" || value.trim() === "") throw new HttpError(400, `${field} is required`);
 }
 
 function assertMoney(value: string, field: string): void {
-  if (!/^\d+(\.\d{1,2})?$/.test(String(value))) throw new Error(`${field} must be money`);
-  if (moneyToCents(value) <= 0) throw new Error(`${field} must be greater than zero`);
+  if (!/^\d+(\.\d{1,2})?$/.test(String(value))) throw new HttpError(400, `${field} must be money`);
+  if (moneyToCents(value) <= 0) throw new HttpError(400, `${field} must be greater than zero`);
 }
 
 function assertPositiveInteger(value: string, field: string): void {
-  if (!/^[1-9]\d*$/.test(value)) throw new Error(`${field} must be a positive integer`);
+  if (!/^[1-9]\d*$/.test(value)) throw new HttpError(400, `${field} must be a positive integer`);
 }
 
 function assertTimeZone(value: string): void {
   try {
     new Intl.DateTimeFormat("zh-CN", { timeZone: value }).format(new Date());
   } catch {
-    throw new Error("time_zone must be a valid IANA timezone");
+    throw new HttpError(400, "time_zone must be a valid IANA timezone");
   }
 }
 
 function assertPaymentTheme(value: string): void {
   if (!["alipay", "minimal", "dark", "warm"].includes(value)) {
-    throw new Error("payment_page_theme is invalid");
+    throw new HttpError(400, "payment_page_theme is invalid");
   }
 }
 
@@ -2180,7 +2549,7 @@ function assertUrl(value: string, field: string): void {
     const isLocalhost = ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
     if (url.protocol !== "https:" && !(url.protocol === "http:" && isLocalhost)) throw new Error();
   } catch {
-    throw new Error(`${field} must be a valid HTTPS URL`);
+    throw new HttpError(400, `${field} must be a valid HTTPS URL`);
   }
 }
 

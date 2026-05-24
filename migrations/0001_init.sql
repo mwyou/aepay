@@ -93,6 +93,18 @@ CREATE TABLE IF NOT EXISTS system_settings (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS admin_login_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip TEXT NOT NULL DEFAULT '',
+  username TEXT NOT NULL DEFAULT '',
+  success INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_login_attempts_created_at ON admin_login_attempts(created_at);
+CREATE INDEX IF NOT EXISTS idx_admin_login_attempts_ip_created_at ON admin_login_attempts(ip, created_at);
+CREATE INDEX IF NOT EXISTS idx_admin_login_attempts_username_created_at ON admin_login_attempts(username, created_at);
+
 INSERT OR IGNORE INTO system_settings (key, value, is_secret, updated_at) VALUES
   ('app_name', 'AEPay', 0, datetime('now')),
   ('time_zone', 'Asia/Shanghai', 0, datetime('now')),
