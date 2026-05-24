@@ -152,7 +152,7 @@ interface AdminLoginAttemptRow {
 const ADMIN_LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const ADMIN_LOGIN_MAX_FAILURES = 5;
 const ADMIN_PASSWORD_HASH_PREFIX = "pbkdf2-sha256";
-const ADMIN_PASSWORD_HASH_ITERATIONS = 210_000;
+const ADMIN_PASSWORD_HASH_ITERATIONS = 100_000;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -1351,8 +1351,12 @@ async function adminPasswordHash(username: string, password: string): Promise<st
 async function verifyAdminPasswordHash(storedHash: string, username: string, password: string): Promise<boolean> {
   const parsed = parseAdminPasswordHash(storedHash);
   if (parsed) {
-    const hash = await pbkdf2Hex(password, parsed.salt, parsed.iterations);
-    return timingSafeEqual(hash, parsed.hash);
+    try {
+      const hash = await pbkdf2Hex(password, parsed.salt, parsed.iterations);
+      return timingSafeEqual(hash, parsed.hash);
+    } catch {
+      return false;
+    }
   }
   return timingSafeEqual(await sha256Hex(`aepay-admin-v1:${username}:${password}`), storedHash);
 }
