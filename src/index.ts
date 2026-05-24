@@ -103,7 +103,9 @@ interface AppConfig {
   orderExpireMinutes: string;
   amountVarianceCents: string;
   collectAccount: string;
+  collectQrAssetId: string;
   collectQrImageUrl: string;
+  paymentQrAssets: PaymentQrAssetRow[];
   paymentPageTheme: string;
   alipayPollEnabled: string;
   alipayPollMethod: string;
@@ -126,6 +128,16 @@ interface SettingRow {
   key: string;
   value: string;
   is_secret: number;
+  updated_at: string;
+}
+
+interface PaymentQrAssetRow {
+  id: number;
+  name: string;
+  source: string;
+  value: string;
+  mime_type: string;
+  created_at: string;
   updated_at: string;
 }
 
@@ -158,6 +170,9 @@ export default {
       if (url.pathname === "/admin" && request.method === "GET") return await requireAdmin(request, env, config, () => adminPage(env, config));
       if (url.pathname === "/api/admin/settings" && request.method === "POST") {
         return await requireAdmin(request, env, config, () => updateSettings(request, env, config));
+      }
+      if (url.pathname === "/api/admin/payment-qr-assets" && request.method === "POST") {
+        return await requireAdmin(request, env, config, () => updatePaymentQrAssets(request, env, config));
       }
       if (url.pathname === "/api/admin/reset" && request.method === "POST") {
         return await requireAdmin(request, env, config, () => resetSystem(request, env));
@@ -216,15 +231,22 @@ class HttpError extends Error {
 }
 
 async function loadConfig(env: Env): Promise<AppConfig> {
-  const rows = await env.DB.prepare("SELECT key, value, is_secret, updated_at FROM system_settings").all<SettingRow>();
+  const [rows, paymentQrAssets] = await Promise.all([
+    env.DB.prepare("SELECT key, value, is_secret, updated_at FROM system_settings").all<SettingRow>(),
+    loadPaymentQrAssets(env),
+  ]);
   const settings = new Map(rows.results.map((row) => [row.key, row.value]));
+  const collectQrAssetId = settings.get("collect_qr_asset_id") || "";
+  const activeQrAsset = paymentQrAssets.find((asset) => String(asset.id) === collectQrAssetId) || null;
   return {
     appName: settings.get("app_name") || env.APP_NAME || "AEPay",
     timeZone: settings.get("time_zone") || "Asia/Shanghai",
     orderExpireMinutes: settings.get("order_expire_minutes") || env.ORDER_EXPIRE_MINUTES || "15",
     amountVarianceCents: settings.get("amount_variance_cents") || env.AMOUNT_VARIANCE_CENTS || "30",
     collectAccount: settings.get("collect_account") || env.COLLECT_ACCOUNT || "",
-    collectQrImageUrl: settings.get("collect_qr_image_url") || env.COLLECT_QR_IMAGE_URL || "",
+    collectQrAssetId: activeQrAsset ? String(activeQrAsset.id) : "",
+    collectQrImageUrl: activeQrAsset?.value || settings.get("collect_qr_image_url") || env.COLLECT_QR_IMAGE_URL || "",
+    paymentQrAssets,
     paymentPageTheme: settings.get("payment_page_theme") || "alipay",
     alipayPollEnabled: settings.get("alipay_poll_enabled") || "false",
     alipayPollMethod: settings.get("alipay_poll_method") || "alipay.data.bill.accountlog.query",
@@ -248,8 +270,6 @@ async function loadConfig(env: Env): Promise<AppConfig> {
 async function updateSettings(request: Request, env: Env, config: AppConfig): Promise<Response> {
   const form = await request.formData();
   const now = new Date().toISOString();
-  const uploadedQrImage = await uploadedImageDataUrl(form, "collect_qr_image_file");
-  const collectQrImageUrl = uploadedQrImage || stringForm(form, "collect_qr_image_url") || config.collectQrImageUrl;
   const alipayPublicKeyInput = stringForm(form, "alipay_public_key_text") || stringForm(form, "alipay_public_key_pem");
   const plain: Record<string, string> = {
     app_name: stringForm(form, "app_name"),
@@ -257,7 +277,6 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
     order_expire_minutes: stringForm(form, "order_expire_minutes"),
     amount_variance_cents: stringForm(form, "amount_variance_cents"),
     collect_account: stringForm(form, "collect_account"),
-    collect_qr_image_url: collectQrImageUrl,
     payment_page_theme: stringForm(form, "payment_page_theme") || "alipay",
     alipay_poll_enabled: stringForm(form, "alipay_poll_enabled") === "true" ? "true" : "false",
     alipay_poll_method: "alipay.data.bill.accountlog.query",
@@ -271,9 +290,6 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
   assertTimeZone(plain.time_zone);
   assertPositiveInteger(plain.order_expire_minutes, "order_expire_minutes");
   assertPositiveInteger(plain.amount_variance_cents, "amount_variance_cents");
-  if (plain.collect_qr_image_url && !plain.collect_qr_image_url.startsWith("data:image/")) {
-    assertUrl(plain.collect_qr_image_url, "collect_qr_image_url");
-  }
   assertPaymentTheme(plain.payment_page_theme);
   assertPositiveInteger(plain.alipay_poll_window_minutes, "alipay_poll_window_minutes");
   if (plain.alipay_gateway_url) assertUrl(plain.alipay_gateway_url, "alipay_gateway_url");
@@ -317,6 +333,105 @@ async function upsertSetting(env: Env, key: string, value: string, isSecret: boo
     .run();
 }
 
+async function updatePaymentQrAssets(request: Request, env: Env, _config: AppConfig): Promise<Response> {
+  const form = await request.formData();
+  const action = stringForm(form, "action") || "upload";
+  if (action === "upload") {
+    const asset = await createPaymentQrAssetFromForm(env, form);
+    await setActivePaymentQrAsset(env, asset.id);
+    return json({ ok: true, asset });
+  }
+  if (action === "select") {
+    const assetId = paymentQrAssetIdFromForm(form);
+    const asset = await findPaymentQrAsset(env, assetId);
+    if (!asset) throw new HttpError(404, "收款码不存在");
+    await setActivePaymentQrAsset(env, asset.id);
+    return json({ ok: true, asset });
+  }
+  if (action === "delete") {
+    const assetId = paymentQrAssetIdFromForm(form);
+    const deleted = await deletePaymentQrAsset(env, assetId);
+    return json({ ok: true, deleted });
+  }
+  throw new HttpError(400, "unsupported payment qr asset action");
+}
+
+async function createPaymentQrAssetFromForm(env: Env, form: FormData): Promise<PaymentQrAssetRow> {
+  const name = stringForm(form, "payment_qr_name");
+  const url = stringForm(form, "payment_qr_image_url");
+  const file = form.get("payment_qr_image_file");
+  const now = new Date().toISOString();
+
+  if (file instanceof File && file.size > 0) {
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+      throw new HttpError(400, "收款码图片只支持 PNG、JPG 或 WebP");
+    }
+    if (file.size > 750_000) {
+      throw new HttpError(400, "收款码图片不能超过 750KB");
+    }
+    const inserted = await env.DB.prepare(
+      `INSERT INTO payment_qr_assets (name, source, value, mime_type, created_at, updated_at)
+       VALUES (?, 'upload', ?, ?, ?, ?) RETURNING *`,
+    )
+      .bind(
+        name || file.name || `收款码 ${now.slice(0, 10)}`,
+        `data:${file.type};base64,${arrayBufferToBase64(await file.arrayBuffer())}`,
+        file.type,
+        now,
+        now,
+      )
+      .first<PaymentQrAssetRow>();
+    if (!inserted) throw new HttpError(500, "failed to save payment qr asset");
+    return inserted;
+  }
+
+  if (url) {
+    assertUrl(url, "payment_qr_image_url");
+    const inserted = await env.DB.prepare(
+      `INSERT INTO payment_qr_assets (name, source, value, mime_type, created_at, updated_at)
+       VALUES (?, 'url', ?, ?, ?, ?) RETURNING *`,
+    )
+      .bind(name || `外链收款码 ${now.slice(0, 10)}`, url, "text/uri-list", now, now)
+      .first<PaymentQrAssetRow>();
+    if (!inserted) throw new HttpError(500, "failed to save payment qr asset");
+    return inserted;
+  }
+
+  throw new HttpError(400, "请先选择图片文件或填写收款码 URL");
+}
+
+function paymentQrAssetIdFromForm(form: FormData): number {
+  const value = stringForm(form, "id");
+  assertPositiveInteger(value, "id");
+  return Number.parseInt(value, 10);
+}
+
+async function findPaymentQrAsset(env: Env, id: number): Promise<PaymentQrAssetRow | null> {
+  try {
+    return await env.DB.prepare("SELECT * FROM payment_qr_assets WHERE id = ?").bind(id).first<PaymentQrAssetRow>();
+  } catch {
+    return null;
+  }
+}
+
+async function setActivePaymentQrAsset(env: Env, assetId: number | null): Promise<void> {
+  await upsertSetting(env, "collect_qr_asset_id", assetId ? String(assetId) : "", false, new Date().toISOString());
+}
+
+async function deletePaymentQrAsset(env: Env, assetId: number): Promise<{ id: number; activeId: number | null }> {
+  const existing = await findPaymentQrAsset(env, assetId);
+  if (!existing) throw new HttpError(404, "收款码不存在");
+  await env.DB.prepare("DELETE FROM payment_qr_assets WHERE id = ?").bind(assetId).run();
+  const activeSetting = await env.DB.prepare("SELECT value FROM system_settings WHERE key = 'collect_qr_asset_id'").first<{ value: string }>();
+  const stillActive = activeSetting?.value === String(assetId);
+  if (stillActive) {
+    const next = await env.DB.prepare("SELECT id FROM payment_qr_assets ORDER BY updated_at DESC, id DESC LIMIT 1").first<{ id: number }>();
+    await setActivePaymentQrAsset(env, next?.id ?? null);
+    return { id: assetId, activeId: next?.id ?? null };
+  }
+  return { id: assetId, activeId: activeSetting?.value ? Number.parseInt(activeSetting.value, 10) : null };
+}
+
 async function resetSystem(request: Request, env: Env): Promise<Response> {
   const form = await request.formData();
   if (stringForm(form, "confirm") !== "RESET") {
@@ -332,6 +447,7 @@ async function resetSystem(request: Request, env: Env): Promise<Response> {
 
   await env.DB.batch([
     env.DB.prepare("DELETE FROM admin_login_attempts"),
+    env.DB.prepare("DELETE FROM payment_qr_assets"),
     env.DB.prepare("DELETE FROM callback_logs"),
     env.DB.prepare("DELETE FROM payment_events"),
     env.DB.prepare("DELETE FROM alipay_transactions"),
@@ -357,6 +473,7 @@ async function seedDefaultSettings(env: Env): Promise<void> {
     ["amount_variance_cents", "30", false],
     ["collect_account", "", false],
     ["collect_qr_image_url", "", false],
+    ["collect_qr_asset_id", "", false],
     ["payment_page_theme", "alipay", false],
     ["alipay_poll_enabled", "false", false],
     ["alipay_poll_method", "alipay.data.bill.accountlog.query", false],
@@ -394,6 +511,15 @@ async function uploadedImageDataUrl(form: FormData, key: string): Promise<string
     throw new HttpError(400, "收款码图片不能超过 750KB");
   }
   return `data:${value.type};base64,${arrayBufferToBase64(await value.arrayBuffer())}`;
+}
+
+async function loadPaymentQrAssets(env: Env): Promise<PaymentQrAssetRow[]> {
+  try {
+    const rows = await env.DB.prepare("SELECT * FROM payment_qr_assets ORDER BY updated_at DESC, id DESC").all<PaymentQrAssetRow>();
+    return rows.results;
+  } catch {
+    return [];
+  }
 }
 
 function normalizePublicKeyPem(value: string): string {
@@ -1414,11 +1540,14 @@ function orderResponse(config: AppConfig, order: OrderRow, requestUrl: string): 
 function paymentTheme(name: string): {
   colorScheme: string;
   bg: string;
+  bg2: string;
   panel: string;
+  panelSoft: string;
   text: string;
   muted: string;
   line: string;
   brand: string;
+  brand2: string;
   accent: string;
   ok: string;
   qrBg: string;
@@ -1429,11 +1558,14 @@ function paymentTheme(name: string): {
     minimal: {
       colorScheme: "light",
       bg: "#f6f8fb",
+      bg2: "#eef2f8",
       panel: "#ffffff",
+      panelSoft: "#f8fafc",
       text: "#1f2937",
       muted: "#667085",
       line: "#dfe5ee",
       brand: "#102a43",
+      brand2: "#3b82f6",
       accent: "#2563eb",
       ok: "#147d64",
       qrBg: "#ffffff",
@@ -1442,45 +1574,122 @@ function paymentTheme(name: string): {
     },
     alipay: {
       colorScheme: "light",
-      bg: "#eaf4ff",
+      bg: "#eef6ff",
+      bg2: "#dfeeff",
       panel: "#ffffff",
+      panelSoft: "#f7fbff",
       text: "#132238",
       muted: "#5b6b80",
-      line: "#cfe2f7",
+      line: "#d2e3f3",
       brand: "#1677ff",
+      brand2: "#4f8dff",
       accent: "#1677ff",
       ok: "#0f8f6b",
       qrBg: "#f7fbff",
-      radius: "8px",
-      shadow: "0 18px 50px rgba(22,119,255,.18)",
+      radius: "18px",
+      shadow: "0 22px 56px rgba(22,119,255,.18)",
+    },
+    pearl: {
+      colorScheme: "light",
+      bg: "#f8fbff",
+      bg2: "#edf5ff",
+      panel: "#ffffff",
+      panelSoft: "#f6faff",
+      text: "#122033",
+      muted: "#5d6d82",
+      line: "#dce7f3",
+      brand: "#1d4ed8",
+      brand2: "#78b1ff",
+      accent: "#2563eb",
+      ok: "#127a61",
+      qrBg: "#f8fbff",
+      radius: "22px",
+      shadow: "0 20px 54px rgba(30,64,175,.14)",
+    },
+    aurora: {
+      colorScheme: "light",
+      bg: "#eef6ff",
+      bg2: "#d8e9ff",
+      panel: "#ffffff",
+      panelSoft: "#f7fbff",
+      text: "#132238",
+      muted: "#596b81",
+      line: "#d7e4f4",
+      brand: "#2563eb",
+      brand2: "#7ab0ff",
+      accent: "#1d4ed8",
+      ok: "#0f8f6b",
+      qrBg: "#f8fbff",
+      radius: "24px",
+      shadow: "0 24px 60px rgba(37,99,235,.18)",
+    },
+    graphite: {
+      colorScheme: "light",
+      bg: "#f4f7fb",
+      bg2: "#e7edf4",
+      panel: "#ffffff",
+      panelSoft: "#f7f9fc",
+      text: "#1f2937",
+      muted: "#687385",
+      line: "#d7dfe8",
+      brand: "#1f3a5f",
+      brand2: "#446892",
+      accent: "#2563eb",
+      ok: "#157f5f",
+      qrBg: "#ffffff",
+      radius: "20px",
+      shadow: "0 20px 54px rgba(31,41,55,.12)",
     },
     dark: {
       colorScheme: "dark",
       bg: "#101418",
+      bg2: "#151b24",
       panel: "#171d23",
+      panelSoft: "#1d2430",
       text: "#eef4f8",
       muted: "#a9b4bf",
       line: "#2b3640",
       brand: "#22c55e",
+      brand2: "#0ea5e9",
       accent: "#38bdf8",
       ok: "#4ade80",
       qrBg: "#ffffff",
-      radius: "8px",
+      radius: "18px",
       shadow: "0 18px 60px rgba(0,0,0,.35)",
     },
     warm: {
       colorScheme: "light",
       bg: "#f8f1e8",
+      bg2: "#f0e6d8",
       panel: "#fffdf9",
+      panelSoft: "#fff8ef",
       text: "#2b2118",
       muted: "#7a6a5a",
       line: "#eadfcc",
       brand: "#b45309",
+      brand2: "#d97706",
       accent: "#c2410c",
       ok: "#15803d",
       qrBg: "#fffaf2",
-      radius: "8px",
+      radius: "18px",
       shadow: "0 18px 46px rgba(120,80,30,.14)",
+    },
+    midnight: {
+      colorScheme: "dark",
+      bg: "#0b1020",
+      bg2: "#101a33",
+      panel: "#111a2d",
+      panelSoft: "#16213a",
+      text: "#eef4ff",
+      muted: "#a4b2c7",
+      line: "#253451",
+      brand: "#4f7cff",
+      brand2: "#7b68ff",
+      accent: "#68d4ff",
+      ok: "#52d29a",
+      qrBg: "#ffffff",
+      radius: "24px",
+      shadow: "0 24px 70px rgba(2,6,23,.48)",
     },
   };
   return themes[name as keyof typeof themes] || themes.alipay;
@@ -1493,6 +1702,9 @@ function renderPaymentPage(config: AppConfig, order: OrderRow): string {
   const qr = config.collectQrImageUrl
     ? `<img class="qr" src="${escapeHtml(config.collectQrImageUrl)}" alt="支付宝收款码">`
     : `<div class="empty">未配置收款码图片，请向商户索取支付宝收款码。</div>`;
+  const payState = done
+    ? `<div class="state-card paid-state"><strong>支付已确认</strong><span>订单已到账，无需重复支付。</span></div>`
+    : `<div class="qr-stage"><div class="qr-glow"></div><div class="qr-wrap">${qr}</div></div><p class="hint">请按页面金额付款，付款后将自动确认。</p>`;
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1500,39 +1712,107 @@ function renderPaymentPage(config: AppConfig, order: OrderRow): string {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>支付订单 ${escapeHtml(order.merchant_order_no)}</title>
   <style>
-    :root { color-scheme:${theme.colorScheme}; --bg:${theme.bg}; --panel:${theme.panel}; --text:${theme.text}; --muted:${theme.muted}; --line:${theme.line}; --brand:${theme.brand}; --accent:${theme.accent}; --ok:${theme.ok}; }
+    :root { color-scheme:${theme.colorScheme}; --bg:${theme.bg}; --bg-2:${theme.bg2}; --panel:${theme.panel}; --panel-soft:${theme.panelSoft}; --text:${theme.text}; --muted:${theme.muted}; --line:${theme.line}; --brand:${theme.brand}; --brand-2:${theme.brand2}; --accent:${theme.accent}; --ok:${theme.ok}; --qrBg:${theme.qrBg}; --radius:${theme.radius}; --shadow:${theme.shadow}; }
     * { box-sizing:border-box; }
-    body { margin:0; min-height:100vh; display:grid; place-items:center; padding:20px; background:var(--bg); color:var(--text); font:15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    main { width:min(430px, 100%); background:var(--panel); border:1px solid var(--line); border-radius:${theme.radius}; padding:22px; text-align:center; box-shadow:${theme.shadow}; }
-    .brand { width:44px; height:44px; margin:0 auto 12px; display:grid; place-items:center; border-radius:12px; color:white; background:var(--brand); font-size:22px; font-weight:850; }
-    h1 { margin:0 0 10px; font-size:20px; }
-    .amount { margin:8px 0 16px; font-size:42px; font-weight:800; color:var(--accent); }
-    .qr-wrap { margin:0 auto; padding:12px; border:1px solid var(--line); border-radius:${theme.radius}; background:${theme.qrBg}; }
-    .qr { width:min(280px, 68vw); aspect-ratio:1; object-fit:contain; display:block; margin:auto; border-radius:6px; }
-    .empty { border:1px dashed var(--line); border-radius:${theme.radius}; padding:34px 18px; color:var(--muted); }
-    .meta { margin-top:16px; color:var(--muted); font-size:13px; text-align:left; display:grid; gap:6px; }
-    .meta div { display:flex; justify-content:space-between; gap:12px; border-bottom:1px solid var(--line); padding-bottom:6px; }
+    body { margin:0; min-height:100vh; padding:34px 22px; color:var(--text); font:15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:radial-gradient(circle at 18% 8%, color-mix(in srgb, var(--brand) 22%, transparent), transparent 28%), radial-gradient(circle at 88% 12%, color-mix(in srgb, var(--brand-2) 20%, transparent), transparent 30%), linear-gradient(145deg, var(--bg-2), var(--bg)); }
+    main { width:min(1080px, 100%); margin:0 auto; overflow:hidden; border:1px solid color-mix(in srgb, var(--line) 82%, transparent); border-radius:30px; background:color-mix(in srgb, var(--panel) 92%, transparent); box-shadow:var(--shadow); backdrop-filter:blur(18px); }
+    .topbar { min-height:74px; display:flex; align-items:center; justify-content:space-between; gap:18px; padding:18px 24px; color:#fff; background:linear-gradient(132deg, var(--brand), var(--brand-2)); position:relative; overflow:hidden; }
+    .topbar:after { content:""; position:absolute; inset:-80px 18% auto auto; width:280px; height:180px; transform:rotate(18deg); background:rgba(255,255,255,.14); border-radius:36px; }
+    .brand-row { position:relative; z-index:1; display:flex; align-items:center; gap:14px; min-width:0; }
+    .brand { width:42px; height:42px; display:grid; place-items:center; border-radius:14px; color:white; background:rgba(255,255,255,.18); font-size:22px; font-weight:900; box-shadow:inset 0 0 0 1px rgba(255,255,255,.18); }
+    .title-stack { min-width:0; }
+    h1 { margin:0; font-size:22px; line-height:1.2; letter-spacing:.02em; }
+    .subtitle { margin-top:3px; color:rgba(255,255,255,.78); font-size:13px; }
+    .safe-badge { position:relative; z-index:1; display:inline-flex; align-items:center; gap:8px; min-height:38px; padding:0 14px; border-radius:999px; background:rgba(255,255,255,.16); box-shadow:inset 0 0 0 1px rgba(255,255,255,.16); font-weight:750; white-space:nowrap; }
+    .content { display:grid; grid-template-columns:minmax(0, 1.08fr) minmax(330px, .92fr); }
+    .pay-column, .info-column { padding:28px; }
+    .pay-column { display:grid; gap:18px; background:linear-gradient(180deg, color-mix(in srgb, var(--panel-soft) 72%, transparent), transparent); border-right:1px solid var(--line); }
+    .timer { display:grid; gap:8px; place-items:center; min-height:142px; padding:20px; border:1px solid color-mix(in srgb, var(--brand) 18%, var(--line)); border-radius:24px; color:var(--muted); background:linear-gradient(135deg, color-mix(in srgb, var(--brand) 92%, #111827), var(--brand-2)); box-shadow:0 18px 42px color-mix(in srgb, var(--brand) 18%, transparent); }
+    .timer-label { color:rgba(255,255,255,.78); font-weight:750; }
+    .timer strong { color:#fff; font-size:48px; line-height:1; letter-spacing:.08em; text-shadow:0 0 28px rgba(255,255,255,.5); }
+    .timer-note { color:rgba(255,255,255,.7); font-size:13px; }
+    .amount-card { display:flex; align-items:center; justify-content:space-between; gap:18px; padding:18px 20px; border:1px solid var(--line); border-radius:22px; background:var(--panel); box-shadow:0 12px 32px rgba(15,23,42,.06); }
+    .amount-card span { color:var(--muted); font-weight:750; }
+    .amount { font-size:42px; font-weight:900; line-height:1; color:#f26b6f; letter-spacing:.03em; }
+    .copy-btn { height:42px; border:0; border-radius:14px; padding:0 18px; color:#fff; background:linear-gradient(135deg, var(--brand), var(--brand-2)); box-shadow:0 12px 26px color-mix(in srgb, var(--brand) 24%, transparent); font-weight:850; cursor:pointer; }
+    .qr-card { padding:22px; border:1px solid var(--line); border-radius:26px; background:var(--panel); box-shadow:0 16px 38px rgba(15,23,42,.07); text-align:center; }
+    .qr-stage { position:relative; display:grid; place-items:center; padding:18px; }
+    .qr-glow { position:absolute; inset:28px; border-radius:32px; background:radial-gradient(circle, color-mix(in srgb, var(--brand) 20%, transparent), transparent 64%); filter:blur(14px); }
+    .qr-wrap { position:relative; margin:0 auto; padding:18px; border:1px solid color-mix(in srgb, var(--brand) 18%, var(--line)); border-radius:22px; background:linear-gradient(145deg, var(--qrBg), var(--panel-soft)); }
+    .qr { width:min(312px, 68vw); aspect-ratio:1; object-fit:contain; display:block; margin:auto; border-radius:14px; background:#fff; }
+    .empty { width:min(312px, 68vw); min-height:240px; display:grid; place-items:center; border:1px dashed var(--line); border-radius:18px; padding:34px 18px; color:var(--muted); background:var(--panel-soft); }
+    .hint { margin:10px 0 0; color:var(--muted); font-size:13px; }
+    .info-column { display:grid; gap:18px; align-content:start; background:color-mix(in srgb, var(--panel) 72%, var(--panel-soft)); }
+    .channel { display:flex; align-items:center; justify-content:center; gap:12px; padding:17px; border:1px solid var(--line); border-radius:24px; background:var(--panel); box-shadow:0 12px 30px rgba(15,23,42,.05); font-size:18px; font-weight:900; }
+    .channel-mark { width:36px; height:36px; display:grid; place-items:center; border-radius:13px; color:#fff; background:linear-gradient(135deg, var(--brand), var(--brand-2)); }
+    .panel-card { padding:22px; border:1px solid var(--line); border-radius:24px; background:var(--panel); box-shadow:0 12px 30px rgba(15,23,42,.05); }
+    .panel-card h2 { margin:0 0 16px; font-size:20px; letter-spacing:.01em; }
+    .meta { display:grid; gap:0; color:var(--muted); font-size:14px; }
+    .meta div { display:flex; justify-content:space-between; gap:18px; border-bottom:1px solid var(--line); padding:12px 0; }
     .meta div:last-child { border-bottom:0; padding-bottom:0; }
-    .timer { margin:0 0 16px; min-height:32px; display:flex; align-items:center; justify-content:center; gap:8px; border:1px solid var(--line); border-radius:${theme.radius}; color:var(--muted); background:rgba(255,255,255,.35); font-weight:700; }
-    .timer strong { color:var(--accent); }
-    .hint { margin:12px 0 0; color:var(--muted); font-size:13px; }
-    .paid { color:var(--ok); font-weight:750; }
-    .expired { color:#b42318; font-weight:750; }
+    .meta strong { color:var(--text); text-align:right; word-break:break-all; }
+    .steps { margin:0; padding-left:19px; color:var(--muted); display:grid; gap:10px; }
+    .steps strong { color:var(--text); }
+    .state-card { min-height:280px; display:grid; place-items:center; gap:8px; border:1px solid var(--line); border-radius:22px; background:var(--panel-soft); color:var(--muted); }
+    .state-card strong { display:block; color:var(--ok); font-size:22px; }
+    .paid { color:var(--ok); font-weight:850; }
+    .expired { color:#d92d20; font-weight:850; }
+    .footer { padding:16px 24px; color:#fff; text-align:center; font-size:13px; font-weight:750; background:linear-gradient(132deg, var(--brand), var(--brand-2)); }
+    @media (max-width: 860px) { body { padding:14px; } main { border-radius:24px; } .topbar { align-items:flex-start; flex-direction:column; } .content { grid-template-columns:1fr; } .pay-column { border-right:0; border-bottom:1px solid var(--line); } .pay-column, .info-column { padding:18px; } .amount-card { align-items:flex-start; flex-direction:column; } .timer strong { font-size:42px; } }
   </style>
 </head>
 <body>
   <main>
-    <div class="brand">支</div>
-    <h1 id="title">${escapeHtml(done ? "支付已确认" : "支付宝扫码付款")}</h1>
-    <div class="amount" id="amount">¥${escapeHtml(order.pay_amount)}</div>
-    <div class="timer" id="timer" ${done ? "hidden" : ""}>剩余支付时间 <strong>--:--</strong></div>
-    <div id="pay-state">${done ? `<p class="paid">订单已到账，无需重复支付。</p>` : `<div class="qr-wrap">${qr}</div><p class="hint">请按页面金额付款，付款后将自动确认。</p>`}</div>
-    <div class="meta">
-      <div><span>订单号</span><strong>${escapeHtml(order.merchant_order_no)}</strong></div>
-      <div><span>商品</span><strong>${escapeHtml(order.subject || "-")}</strong></div>
-      <div><span>状态</span><strong id="status">${escapeHtml(order.status)}</strong></div>
-      <div><span>过期时间</span><strong>${escapeHtml(shortDate(order.expires_at, config.timeZone))}</strong></div>
+    <div class="topbar">
+      <div class="brand-row">
+        <div class="brand">支</div>
+        <div class="title-stack">
+          <h1 id="title">${escapeHtml(done ? "支付已确认" : "订单支付")}</h1>
+          <div class="subtitle" id="subtitle">${escapeHtml(done ? "订单已经到账，无需再次支付" : "请使用手机扫描二维码完成支付")}</div>
+        </div>
+      </div>
+      <div class="safe-badge">安全收银台</div>
     </div>
+    <div class="content">
+      <section class="pay-column">
+        <div class="timer" id="timer" ${done ? "hidden" : ""}>
+          <div class="timer-label">支付剩余时间</div>
+          <strong>--:--</strong>
+          <div class="timer-note">超时订单将自动关闭</div>
+        </div>
+        <div class="amount-card">
+          <div>
+            <span>支付金额</span>
+            <div class="amount">¥${escapeHtml(order.pay_amount)}</div>
+          </div>
+          <button class="copy-btn" type="button" id="copy-amount-button">复制金额</button>
+        </div>
+        <div class="qr-card" id="pay-state">${payState}</div>
+      </section>
+      <aside class="info-column">
+        <div class="channel"><span class="channel-mark">支</span><span>支付宝</span></div>
+        <div class="panel-card">
+          <h2>订单信息</h2>
+          <div class="meta">
+            <div><span>订单编号</span><strong>${escapeHtml(order.merchant_order_no)}</strong></div>
+            <div><span>商品名称</span><strong>${escapeHtml(order.subject || "-")}</strong></div>
+            <div><span>创建时间</span><strong>${escapeHtml(shortDate(order.created_at, config.timeZone))}</strong></div>
+            <div><span>订单状态</span><strong id="status">${escapeHtml(order.status)}</strong></div>
+          </div>
+        </div>
+        <div class="panel-card">
+          <h2>支付说明</h2>
+          <ol class="steps">
+            <li><strong>打开支付宝</strong> 或手机扫一扫功能</li>
+            <li>扫描左侧二维码，按页面金额付款</li>
+            <li>支付成功后不要关闭页面，系统会自动确认</li>
+            <li>如遇支付问题，请刷新页面或联系客服</li>
+            <li>支付超时后，请重新创建订单</li>
+          </ol>
+        </div>
+      </aside>
+    </div>
+    <div class="footer">© 2025 ${escapeHtml(config.appName)} | 安全支付保障</div>
   </main>
   <script>
     const orderNo = ${JSON.stringify(order.merchant_order_no)};
@@ -1540,20 +1820,28 @@ function renderPaymentPage(config: AppConfig, order: OrderRow): string {
     const timer = document.querySelector('#timer');
     const statusEl = document.querySelector('#status');
     const title = document.querySelector('#title');
+    const subtitle = document.querySelector('#subtitle');
     const payState = document.querySelector('#pay-state');
+    const copyAmountButton = document.querySelector('#copy-amount-button');
+    const amountValue = ${JSON.stringify(order.pay_amount)};
 
     function renderPaid() {
       title.textContent = '支付已确认';
+      if (subtitle) subtitle.textContent = '订单已经到账，无需再次支付';
       statusEl.textContent = 'paid';
       if (timer) timer.hidden = true;
-      payState.innerHTML = '<p class="paid">订单已到账，无需重复支付。</p>';
+      payState.innerHTML = '<div class="state-card paid-state"><strong>支付已确认</strong><span>订单已到账，无需重复支付。</span></div>';
     }
 
     function renderExpired() {
       title.textContent = '订单已过期';
+      if (subtitle) subtitle.textContent = '请重新创建订单后再次支付';
       statusEl.textContent = 'expired';
-      if (timer) timer.innerHTML = '<span class="expired">订单已过期，请重新下单</span>';
-      payState.innerHTML = '<p class="expired">请不要继续付款，重新创建订单后再支付。</p>';
+      if (timer) {
+        timer.hidden = false;
+        timer.innerHTML = '<div class="timer-label">支付剩余时间</div><strong class="expired">已过期</strong><div class="timer-note">请重新创建订单后再支付</div>';
+      }
+      payState.innerHTML = '<div class="state-card"><strong class="expired">订单已过期</strong><span>请不要继续付款，重新创建订单后再支付。</span></div>';
     }
 
     function tick() {
@@ -1566,7 +1854,8 @@ function renderPaymentPage(config: AppConfig, order: OrderRow): string {
       const total = Math.ceil(left / 1000);
       const minutes = Math.floor(total / 60);
       const seconds = total % 60;
-      timer.innerHTML = '剩余支付时间 <strong>' + String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0') + '</strong>';
+      const target = timer.querySelector('strong');
+      if (target) target.textContent = String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
     }
 
     async function pollStatus() {
@@ -1579,9 +1868,19 @@ function renderPaymentPage(config: AppConfig, order: OrderRow): string {
       } catch {}
     }
 
+    async function copyAmount() {
+      if (!amountValue) return;
+      try {
+        await navigator.clipboard.writeText(amountValue);
+      } catch {
+        window.prompt('浏览器拦截了自动复制，请手动复制：', amountValue);
+      }
+    }
+
     tick();
     setInterval(tick, 1000);
     setInterval(pollStatus, 3000);
+    if (copyAmountButton) copyAmountButton.addEventListener('click', copyAmount);
   </script>
 </body>
 </html>`;
@@ -1594,6 +1893,34 @@ function renderAdmin(
   callbacks: CallbackLogRow[],
   pollingRuns: PollingRunRow[],
 ): string {
+  const totalOrders = orders.length;
+  const paidOrders = orders.filter((row) => row.status === "paid").length;
+  const pendingOrders = orders.filter((row) => row.status === "pending").length;
+  const activeAsset = config.paymentQrAssets.find((asset) => String(asset.id) === config.collectQrAssetId) || null;
+  const activeAssetLabel = activeAsset
+    ? `${activeAsset.name || "未命名"} · ${paymentQrAssetSourceLabel(activeAsset.source)}`
+    : config.collectQrImageUrl
+      ? "备用 URL"
+      : "未配置";
+  const themeLabel = paymentThemeLabel(config.paymentPageTheme);
+  const latestOrder = orders[0] || null;
+  const latestPolling = pollingRuns[0] || null;
+  const latestCallback = callbacks[0] || null;
+  const heroStatus = [
+    latestPolling ? `最近查账 ${escapeHtml(shortDate(latestPolling.started_at, config.timeZone))} · ${escapeHtml(latestPolling.status)}` : "还没有查账记录",
+    latestCallback ? `最近回调 ${escapeHtml(shortDate(latestCallback.updated_at, config.timeZone))} · ${escapeHtml(latestCallback.status)}` : "暂无回调",
+  ].join(" · ");
+  const heroMetrics = [
+    `<article class="metric-card accent"><span>订单总数</span><strong>${totalOrders}</strong><small>${latestOrder ? `最新 ${escapeHtml(shortDate(latestOrder.created_at, config.timeZone))}` : "还没有订单"}</small></article>`,
+    `<article class="metric-card good"><span>已支付</span><strong>${paidOrders}</strong><small>${pendingOrders} 笔待处理</small></article>`,
+    `<article class="metric-card warn"><span>收款码资产</span><strong>${config.paymentQrAssets.length}</strong><small>${escapeHtml(activeAssetLabel)}</small></article>`,
+    `<article class="metric-card dark"><span>自动查账</span><strong>${config.alipayPollEnabled === "true" ? "开启" : "关闭"}</strong><small>${escapeHtml(config.alipayPollEnabled === "true" ? "Cron 每分钟执行一次" : "尚未启用自动查账")}</small></article>`,
+  ].join("");
+  const heroBadges = [
+    `<span class="chip">当前收款码 ${escapeHtml(activeAssetLabel)}</span>`,
+    `<span class="chip">查账窗口 ${escapeHtml(config.alipayPollWindowMinutes)} 分钟</span>`,
+    `<span class="chip">支付页主题 ${escapeHtml(themeLabel)}</span>`,
+  ].join("");
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1601,63 +1928,384 @@ function renderAdmin(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(config.appName)} Admin</title>
   <style>
-    :root { color-scheme: light; --bg:#f7f8fb; --panel:#fff; --text:#1f2937; --muted:#667085; --line:#dde3ea; --ok:#147d64; --warn:#9f6b00; --bad:#b42318; --brand:#2563eb; }
+    :root {
+      color-scheme: light;
+      --bg:#edf3fb;
+      --bg-2:#f7f9fe;
+      --panel:#ffffff;
+      --panel-soft:#f6f9ff;
+      --text:#0f172a;
+      --muted:#5b6474;
+      --line:#d8e1ee;
+      --ok:#147d64;
+      --warn:#a16207;
+      --bad:#b42318;
+      --brand:#265cf0;
+      --brand-2:#4f8cff;
+      --brand-soft:rgba(38,92,240,.12);
+      --shadow:0 20px 56px rgba(15,23,42,.10);
+    }
     * { box-sizing: border-box; }
-    body { margin:0; font:14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
-    header { position:sticky; top:0; z-index:2; background:rgba(255,255,255,.94); border-bottom:1px solid var(--line); backdrop-filter: blur(10px); }
-    .bar { max-width:1180px; margin:auto; padding:14px 20px; display:flex; align-items:center; justify-content:space-between; gap:16px; }
-    h1 { margin:0; font-size:18px; }
-    main { max-width:1180px; margin:0 auto; padding:20px; display:grid; gap:18px; }
-    section { background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-    h2 { margin:0; padding:14px 16px; font-size:15px; border-bottom:1px solid var(--line); }
-    table { width:100%; border-collapse:collapse; }
-    th, td { padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; white-space:nowrap; }
-    th { color:var(--muted); font-weight:600; background:#fafbfc; }
+    body {
+      margin:0;
+      font:14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at 8% 0%, rgba(38,92,240,.14), transparent 28%),
+        radial-gradient(circle at 92% 4%, rgba(79,140,255,.12), transparent 24%),
+        linear-gradient(180deg, var(--bg-2), var(--bg));
+      color:var(--text);
+      position:relative;
+    }
+    body::before {
+      content:"";
+      position:fixed;
+      inset:0;
+      background-image:linear-gradient(rgba(15,23,42,.025) 1px, transparent 1px), linear-gradient(90deg, rgba(15,23,42,.025) 1px, transparent 1px);
+      background-size:72px 72px;
+      mask-image:linear-gradient(180deg, rgba(0,0,0,.72), transparent 92%);
+      pointer-events:none;
+    }
+    header {
+      position:sticky;
+      top:0;
+      z-index:2;
+      background:rgba(255,255,255,.74);
+      border-bottom:1px solid rgba(216,225,238,.9);
+      backdrop-filter: blur(16px);
+    }
+    .bar {
+      max-width:1280px;
+      margin:auto;
+      padding:16px 24px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:18px;
+    }
+    .brand-block { display:flex; align-items:center; gap:14px; min-width:0; }
+    .brand-mark {
+      width:42px;
+      height:42px;
+      border-radius:14px;
+      display:grid;
+      place-items:center;
+      color:#fff;
+      background:linear-gradient(135deg, var(--brand), var(--brand-2));
+      box-shadow:0 14px 32px rgba(38,92,240,.22);
+      font-size:21px;
+      font-weight:900;
+      flex:none;
+    }
+    .brand-copy h1 { margin:0; font-size:18px; letter-spacing:.02em; }
+    .brand-copy p { margin:3px 0 0; color:var(--muted); font-size:12px; }
+    .bar-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+    main { max-width:1280px; margin:0 auto; padding:22px 24px 34px; display:grid; gap:18px; }
+    .hero {
+      display:grid;
+      grid-template-columns:minmax(0, 1.18fr) minmax(300px, .82fr);
+      gap:18px;
+      padding:22px;
+      border:1px solid rgba(216,225,238,.92);
+      border-radius:26px;
+      background:linear-gradient(135deg, rgba(255,255,255,.96), rgba(249,251,255,.92));
+      box-shadow:var(--shadow);
+    }
+    .hero-copy { display:grid; gap:14px; align-content:start; }
+    .eyebrow {
+      display:inline-flex;
+      align-items:center;
+      width:max-content;
+      min-height:28px;
+      padding:0 12px;
+      border-radius:999px;
+      background:var(--brand-soft);
+      color:var(--brand);
+      font-size:12px;
+      font-weight:800;
+      letter-spacing:.02em;
+    }
+    .hero-copy h2 { margin:0; font-size:clamp(26px, 3vw, 40px); line-height:1.08; letter-spacing:-.03em; }
+    .hero-copy p { margin:0; color:var(--muted); font-size:15px; max-width:64ch; }
+    .hero-chips { display:flex; flex-wrap:wrap; gap:8px; }
+    .chip {
+      display:inline-flex;
+      align-items:center;
+      min-height:32px;
+      padding:0 12px;
+      border-radius:999px;
+      background:#fff;
+      border:1px solid var(--line);
+      color:var(--muted);
+      font-size:12px;
+      font-weight:650;
+      box-shadow:0 8px 20px rgba(15,23,42,.04);
+    }
+    .hero-panel {
+      display:grid;
+      gap:12px;
+      align-content:start;
+      padding:18px;
+      border-radius:20px;
+      background:linear-gradient(180deg, rgba(246,249,255,.95), rgba(237,243,253,.95));
+      border:1px solid rgba(216,225,238,.84);
+    }
+    .hero-panel-top {
+      display:grid;
+      gap:8px;
+      padding:16px;
+      border-radius:18px;
+      background:linear-gradient(135deg, var(--brand), var(--brand-2));
+      color:#fff;
+      box-shadow:0 18px 36px rgba(38,92,240,.18);
+    }
+    .hero-panel-top span { font-size:12px; opacity:.85; font-weight:700; }
+    .hero-panel-top strong { font-size:26px; letter-spacing:.01em; }
+    .hero-panel-top p { margin:0; color:rgba(255,255,255,.84); font-size:13px; }
+    .metric-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    .metric-card {
+      padding:14px;
+      border-radius:16px;
+      background:#fff;
+      border:1px solid var(--line);
+      box-shadow:0 10px 24px rgba(15,23,42,.04);
+      display:grid;
+      gap:6px;
+    }
+    .metric-card span { color:var(--muted); font-size:12px; font-weight:700; }
+    .metric-card strong { font-size:22px; line-height:1; letter-spacing:-.02em; }
+    .metric-card small { color:var(--muted); font-size:12px; }
+    .metric-card.accent strong { color:var(--brand); }
+    .metric-card.good strong { color:var(--ok); }
+    .metric-card.warn strong { color:var(--warn); }
+    .metric-card.dark strong { color:var(--text); }
+    section {
+      background:var(--panel);
+      border:1px solid var(--line);
+      border-radius:22px;
+      overflow:hidden;
+      box-shadow:0 16px 38px rgba(15,23,42,.06);
+    }
+    h2 {
+      margin:0;
+      padding:18px 20px;
+      font-size:16px;
+      border-bottom:1px solid rgba(216,225,238,.8);
+      background:linear-gradient(180deg, #fff, #fbfdff);
+    }
+    table { width:100%; border-collapse:separate; border-spacing:0; }
+    th, td {
+      padding:12px 14px;
+      border-bottom:1px solid var(--line);
+      text-align:left;
+      vertical-align:top;
+      white-space:nowrap;
+    }
+    th {
+      color:var(--muted);
+      font-weight:700;
+      background:rgba(248,250,252,.96);
+      backdrop-filter: blur(8px);
+    }
+    tbody tr:nth-child(even) td { background:rgba(250,252,255,.55); }
+    tbody tr:hover td { background:#f8fbff; }
     tr:last-child td { border-bottom:0; }
-    .scroll { overflow:auto; }
-    .pill { display:inline-flex; align-items:center; min-height:24px; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#273ea5; font-size:12px; }
+    th:first-child, td:first-child { padding-left:20px; }
+    th:last-child, td:last-child { padding-right:20px; }
+    .scroll { overflow:auto; padding-bottom:8px; }
+    .pill { display:inline-flex; align-items:center; min-height:24px; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#273ea5; font-size:12px; font-weight:700; }
     .paid { background:#e8f7f1; color:var(--ok); }
     .pending { background:#fff4df; color:var(--warn); }
     .failed { background:#fee4e2; color:var(--bad); }
-    form { padding:16px; display:grid; grid-template-columns:repeat(5,minmax(130px,1fr)); gap:10px; align-items:end; }
+    form {
+      padding:18px 20px 20px;
+      display:grid;
+      grid-template-columns:repeat(5,minmax(130px,1fr));
+      gap:12px;
+      align-items:end;
+    }
     .settings-form { grid-template-columns:repeat(3,minmax(180px,1fr)); align-items:start; }
-    .tabs { display:flex; flex-wrap:wrap; gap:8px; }
-    .tab { height:34px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--text); padding:0 12px; font-weight:650; cursor:pointer; }
-    .tab.active { background:var(--brand); border-color:var(--brand); color:#fff; }
+    .tabs {
+      display:flex;
+      flex-wrap:wrap;
+      gap:10px;
+      padding:8px;
+      border:1px solid rgba(216,225,238,.9);
+      border-radius:18px;
+      background:rgba(255,255,255,.76);
+      box-shadow:0 12px 28px rgba(15,23,42,.05);
+    }
+    .tab {
+      height:40px;
+      border:1px solid transparent;
+      border-radius:12px;
+      background:transparent;
+      color:var(--muted);
+      padding:0 16px;
+      font-weight:750;
+      cursor:pointer;
+      transition:background .18s ease, box-shadow .18s ease, color .18s ease, transform .18s ease;
+    }
+    .tab:hover { background:#fff; color:var(--text); box-shadow:0 8px 18px rgba(15,23,42,.05); transform:translateY(-1px); }
+    .tab.active { background:linear-gradient(135deg, var(--brand), var(--brand-2)); color:#fff; box-shadow:0 12px 24px rgba(38,92,240,.24); }
     .panel[hidden] { display:none !important; }
     label { display:grid; gap:5px; color:var(--muted); font-size:12px; }
-    input, select, textarea { width:100%; min-height:38px; border:1px solid var(--line); border-radius:6px; padding:0 10px; font:inherit; color:var(--text); background:#fff; }
-    textarea { min-height:96px; padding:10px; resize:vertical; }
-    button { height:38px; border:0; border-radius:6px; background:var(--brand); color:white; padding:0 14px; font-weight:600; cursor:pointer; }
-    button:disabled { opacity:.65; cursor:not-allowed; }
-    .note { padding:0 16px 16px; color:var(--muted); }
+    input, select, textarea {
+      width:100%;
+      min-height:40px;
+      border:1px solid var(--line);
+      border-radius:12px;
+      padding:0 12px;
+      font:inherit;
+      color:var(--text);
+      background:#fff;
+      box-shadow:inset 0 1px 0 rgba(255,255,255,.6);
+      transition:border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+    }
+    textarea { min-height:110px; padding:12px; resize:vertical; }
+    input:focus, select:focus, textarea:focus {
+      outline:none;
+      border-color:rgba(38,92,240,.5);
+      box-shadow:0 0 0 4px rgba(38,92,240,.10);
+    }
+    button {
+      height:40px;
+      border:0;
+      border-radius:12px;
+      background:linear-gradient(135deg, var(--brand), var(--brand-2));
+      color:white;
+      padding:0 16px;
+      font-weight:700;
+      cursor:pointer;
+      box-shadow:0 12px 24px rgba(38,92,240,.18);
+      transition:transform .18s ease, box-shadow .18s ease, opacity .18s ease;
+    }
+    button:hover { transform:translateY(-1px); box-shadow:0 16px 28px rgba(38,92,240,.22); }
+    button:disabled { opacity:.65; cursor:not-allowed; transform:none; box-shadow:none; }
+    .note { padding:0 20px 16px; color:var(--muted); }
     .wide { grid-column:1 / -1; }
     .settings-form .note { padding:0; align-self:center; }
-    .action-status { min-height:22px; color:var(--ok); font-weight:650; }
-    .action-status.error { color:var(--bad); }
-    .payment-preview-grid { grid-column:1 / -1; display:grid; grid-template-columns:minmax(220px,300px) minmax(280px,1fr); gap:14px; align-items:start; margin-top:6px; }
-    .preview-card { border:1px solid var(--line); border-radius:10px; background:#fff; padding:14px; display:grid; gap:10px; }
+    .action-status {
+      min-height:22px;
+      padding:10px 12px;
+      border-radius:12px;
+      color:var(--ok);
+      font-weight:650;
+      background:#f3faf7;
+      border:1px solid rgba(20,125,100,.12);
+    }
+    .action-status.error { color:var(--bad); background:#fff7f5; border-color:rgba(180,35,24,.14); }
+    button.secondary { background:#eef4ff; color:#1d4ed8; border:1px solid #d6e3ff; box-shadow:none; }
+    button.secondary:hover { background:#e1ebff; box-shadow:none; }
+    button.danger { background:#fee4e2; color:#b42318; border-color:#fecdca; box-shadow:none; }
+    .qr-manager {
+      grid-column:1 / -1;
+      display:grid;
+      gap:12px;
+      padding:16px;
+      border:1px solid var(--line);
+      border-radius:18px;
+      background:linear-gradient(180deg, #fff, #fbfdff);
+      box-shadow:inset 0 1px 0 rgba(255,255,255,.8);
+    }
+    .qr-manager-head { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    .qr-manager-head strong { color:var(--text); }
+    .qr-manager-head span { color:var(--muted); font-size:12px; }
+    .qr-upload-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; align-items:end; }
+    .qr-upload-grid .wide { grid-column:1 / -1; }
+    .qr-asset-list { display:grid; gap:10px; }
+    .qr-asset {
+      display:grid;
+      grid-template-columns:92px 1fr auto;
+      gap:12px;
+      padding:12px;
+      border:1px solid var(--line);
+      border-radius:16px;
+      background:#fff;
+      transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+    }
+    .qr-asset:hover { transform:translateY(-1px); box-shadow:0 14px 28px rgba(15,23,42,.06); }
+    .qr-asset.active { border-color:rgba(38,92,240,.5); box-shadow:0 16px 30px rgba(38,92,240,.12); }
+    .qr-asset img { width:92px; height:92px; object-fit:contain; border-radius:12px; background:#f8fafc; border:1px solid var(--line); }
+    .qr-asset-body { display:grid; gap:6px; }
+    .qr-asset-body strong { color:var(--text); }
+    .qr-asset-meta { display:flex; flex-wrap:wrap; gap:8px; color:var(--muted); font-size:12px; }
+    .qr-asset-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; align-items:flex-start; }
+    .qr-empty { border:1px dashed var(--line); border-radius:16px; padding:18px; color:var(--muted); background:#fff; }
+    .payment-preview-grid { grid-column:1 / -1; display:grid; grid-template-columns:minmax(240px,320px) minmax(300px,1fr); gap:14px; align-items:start; margin-top:6px; }
+    .preview-card { border:1px solid var(--line); border-radius:18px; background:#fff; padding:16px; display:grid; gap:10px; box-shadow:0 12px 26px rgba(15,23,42,.05); }
     .preview-card strong { color:var(--text); }
-    .saved-qr-frame, .preview-qr-frame { min-height:188px; border:1px dashed var(--line); border-radius:10px; background:#fafbfc; display:grid; place-items:center; padding:12px; color:var(--muted); text-align:center; }
-    .saved-qr-frame img, .preview-qr-frame img { width:min(180px,100%); aspect-ratio:1; object-fit:contain; border-radius:8px; background:#fff; }
-    .pay-preview-canvas { border-radius:12px; padding:18px; background:var(--preview-bg); display:grid; place-items:center; }
+    .saved-qr-frame, .preview-qr-frame {
+      min-height:188px;
+      border:1px dashed var(--line);
+      border-radius:14px;
+      background:#fafbfc;
+      display:grid;
+      place-items:center;
+      padding:12px;
+      color:var(--muted);
+      text-align:center;
+    }
+    .saved-qr-frame img, .preview-qr-frame img { width:min(180px,100%); aspect-ratio:1; object-fit:contain; border-radius:10px; background:#fff; }
+    .pay-preview-canvas { border-radius:22px; padding:18px; background:linear-gradient(180deg, var(--preview-bg), var(--preview-bg-2)); display:grid; place-items:center; min-height:520px; }
     .pay-preview-phone { width:min(350px,100%); border:1px solid var(--preview-line); border-radius:var(--preview-radius); padding:18px; text-align:center; background:var(--preview-panel); color:var(--preview-text); box-shadow:var(--preview-shadow); }
-    .pay-preview-mark { width:42px; height:42px; margin:0 auto 10px; border-radius:12px; display:grid; place-items:center; background:var(--preview-brand); color:#fff; font-size:22px; font-weight:850; }
+    .pay-preview-mark { width:42px; height:42px; margin:0 auto 10px; border-radius:12px; display:grid; place-items:center; background:linear-gradient(135deg, var(--preview-brand), var(--preview-brand-2)); color:#fff; font-size:22px; font-weight:850; }
     .pay-preview-phone h3 { margin:0 0 8px; font-size:18px; }
     .pay-preview-amount { margin:6px 0 12px; color:var(--preview-accent); font-size:36px; font-weight:850; }
-    .pay-preview-timer { margin:0 0 12px; min-height:30px; display:flex; align-items:center; justify-content:center; border:1px solid var(--preview-line); border-radius:var(--preview-radius); color:var(--preview-muted); font-weight:700; background:rgba(255,255,255,.35); }
+    .pay-preview-timer { margin:0 0 12px; min-height:30px; display:flex; align-items:center; justify-content:center; border:1px solid var(--preview-line); border-radius:var(--preview-radius); color:var(--preview-muted); font-weight:700; background:var(--preview-panel-soft); }
+    .preview-qr-frame { background:var(--preview-qr-bg); }
     .pay-preview-meta { margin-top:12px; display:grid; gap:6px; color:var(--preview-muted); font-size:12px; text-align:left; }
     .pay-preview-meta div { display:flex; justify-content:space-between; gap:10px; border-bottom:1px solid var(--preview-line); padding-bottom:6px; }
     .pay-preview-meta div:last-child { border-bottom:0; padding-bottom:0; }
-    @media (max-width: 850px) { form, .settings-form, .payment-preview-grid { grid-template-columns:1fr; } .bar { align-items:flex-start; flex-direction:column; } }
+    @media (max-width: 920px) {
+      .hero { grid-template-columns:1fr; }
+      .metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .payment-preview-grid { grid-template-columns:1fr; }
+    }
+    @media (max-width: 850px) {
+      form, .settings-form, .payment-preview-grid, .qr-upload-grid, .qr-asset { grid-template-columns:1fr; }
+      .bar { align-items:flex-start; flex-direction:column; }
+      .bar-actions { width:100%; justify-content:flex-start; }
+      .hero, .qr-manager, .preview-card { padding:16px; }
+      .metric-grid { grid-template-columns:1fr; }
+      .qr-asset-actions { justify-content:flex-start; }
+    }
   </style>
 </head>
 <body>
-  <header><div class="bar"><h1>${escapeHtml(config.appName)}</h1><span class="pill">Cloudflare Workers + D1</span></div></header>
+  <header>
+    <div class="bar">
+      <div class="brand-block">
+        <div class="brand-mark">支</div>
+        <div class="brand-copy">
+          <h1>${escapeHtml(config.appName)}</h1>
+          <p>支付后台 · 收款码 · 查账 · 回调</p>
+        </div>
+      </div>
+      <div class="bar-actions">
+        <span class="pill">Cloudflare Workers + D1</span>
+        <form method="post" action="/admin/logout" style="padding:0; display:flex;">
+          <button type="submit" class="secondary" style="width:auto;">退出登录</button>
+        </form>
+      </div>
+    </div>
+  </header>
   <main>
-    <form method="post" action="/admin/logout" style="padding:0; display:flex; justify-content:flex-end;">
-      <button type="submit" style="width:auto;">退出登录</button>
-    </form>
+    <section class="hero">
+      <div class="hero-copy">
+        <span class="eyebrow">控制台总览</span>
+        <h2>${escapeHtml(config.appName)} 的支付工作台</h2>
+        <p>把订单、二维码、自动查账和回调日志放在一张干净的桌面上。当前主题是 <strong>${escapeHtml(themeLabel)}</strong>，收款码资产共 ${config.paymentQrAssets.length} 套。</p>
+        <div class="hero-chips">${heroBadges}</div>
+      </div>
+      <div class="hero-panel">
+        <div class="hero-panel-top">
+          <span>${config.alipayPollEnabled === "true" ? "自动查账已开启" : "自动查账未开启"}</span>
+          <strong>${escapeHtml(themeLabel)}</strong>
+          <p>${heroStatus}</p>
+        </div>
+        <div class="metric-grid">${heroMetrics}</div>
+      </div>
+    </section>
     <nav class="tabs" aria-label="后台导航">
       <button class="tab active" type="button" data-tab="overview">概览</button>
       <button class="tab" type="button" data-tab="system">系统</button>
@@ -1788,6 +2436,12 @@ function renderAdmin(
         .replace('-----END PUBLIC KEY-----', '')
         .replace(/\\s+/g, '');
     }
+    function alipayPrivateKeyText(privatePem) {
+      return privatePem
+        .replace('-----BEGIN PRIVATE KEY-----', '')
+        .replace('-----END PRIVATE KEY-----', '')
+        .replace(/\\s+/g, '');
+    }
     function previewSecretText(value) {
       if (!value) return '未配置';
       return value.length <= 10 ? value : value.slice(0, 4) + '...' + value.slice(-4);
@@ -1843,17 +2497,30 @@ function renderAdmin(
       }
     }
     const paymentPreviewThemes = {
-      minimal: { bg:'#f6f8fb', panel:'#ffffff', text:'#1f2937', muted:'#667085', line:'#dfe5ee', brand:'#102a43', accent:'#2563eb', radius:'8px', shadow:'0 12px 40px rgba(15,23,42,.08)' },
-      alipay: { bg:'#eaf4ff', panel:'#ffffff', text:'#132238', muted:'#5b6b80', line:'#cfe2f7', brand:'#1677ff', accent:'#1677ff', radius:'8px', shadow:'0 18px 50px rgba(22,119,255,.18)' },
-      dark: { bg:'#101418', panel:'#171d23', text:'#eef4f8', muted:'#a9b4bf', line:'#2b3640', brand:'#22c55e', accent:'#38bdf8', radius:'8px', shadow:'0 18px 60px rgba(0,0,0,.35)' },
-      warm: { bg:'#f8f1e8', panel:'#fffdf9', text:'#2b2118', muted:'#7a6a5a', line:'#eadfcc', brand:'#b45309', accent:'#c2410c', radius:'8px', shadow:'0 18px 46px rgba(120,80,30,.14)' }
+      minimal: { colorScheme:'light', bg:'#f6f8fb', bg2:'#eef2f8', panel:'#ffffff', panelSoft:'#f8fafc', text:'#1f2937', muted:'#667085', line:'#dfe5ee', brand:'#102a43', brand2:'#3b82f6', accent:'#2563eb', qrBg:'#ffffff', radius:'8px', shadow:'0 12px 40px rgba(15,23,42,.08)' },
+      alipay: { colorScheme:'light', bg:'#eef6ff', bg2:'#dfeeff', panel:'#ffffff', panelSoft:'#f7fbff', text:'#132238', muted:'#5b6b80', line:'#d2e3f3', brand:'#1677ff', brand2:'#4f8dff', accent:'#1677ff', qrBg:'#f7fbff', radius:'18px', shadow:'0 22px 56px rgba(22,119,255,.18)' },
+      pearl: { colorScheme:'light', bg:'#f8fbff', bg2:'#edf5ff', panel:'#ffffff', panelSoft:'#f6faff', text:'#122033', muted:'#5d6d82', line:'#dce7f3', brand:'#1d4ed8', brand2:'#78b1ff', accent:'#2563eb', qrBg:'#f8fbff', radius:'22px', shadow:'0 20px 54px rgba(30,64,175,.14)' },
+      aurora: { colorScheme:'light', bg:'#eef6ff', bg2:'#d8e9ff', panel:'#ffffff', panelSoft:'#f7fbff', text:'#132238', muted:'#596b81', line:'#d7e4f4', brand:'#2563eb', brand2:'#7ab0ff', accent:'#1d4ed8', qrBg:'#f8fbff', radius:'24px', shadow:'0 24px 60px rgba(37,99,235,.18)' },
+      graphite: { colorScheme:'light', bg:'#f4f7fb', bg2:'#e7edf4', panel:'#ffffff', panelSoft:'#f7f9fc', text:'#1f2937', muted:'#687385', line:'#d7dfe8', brand:'#1f3a5f', brand2:'#446892', accent:'#2563eb', qrBg:'#ffffff', radius:'20px', shadow:'0 20px 54px rgba(31,41,55,.12)' },
+      dark: { colorScheme:'dark', bg:'#101418', bg2:'#151b24', panel:'#171d23', panelSoft:'#1d2430', text:'#eef4f8', muted:'#a9b4bf', line:'#2b3640', brand:'#22c55e', brand2:'#0ea5e9', accent:'#38bdf8', qrBg:'#ffffff', radius:'18px', shadow:'0 18px 60px rgba(0,0,0,.35)' },
+      warm: { colorScheme:'light', bg:'#f8f1e8', bg2:'#f0e6d8', panel:'#fffdf9', panelSoft:'#fff8ef', text:'#2b2118', muted:'#7a6a5a', line:'#eadfcc', brand:'#b45309', brand2:'#d97706', accent:'#c2410c', qrBg:'#fffaf2', radius:'18px', shadow:'0 18px 46px rgba(120,80,30,.14)' },
+      midnight: { colorScheme:'dark', bg:'#0b1020', bg2:'#101a33', panel:'#111a2d', panelSoft:'#16213a', text:'#eef4ff', muted:'#a4b2c7', line:'#253451', brand:'#4f7cff', brand2:'#7b68ff', accent:'#68d4ff', qrBg:'#ffffff', radius:'24px', shadow:'0 24px 70px rgba(2,6,23,.48)' }
     };
     function setPaymentPreviewTheme(name) {
       const theme = paymentPreviewThemes[name] || paymentPreviewThemes.alipay;
       const preview = document.querySelector('#payment-page-preview');
       if (!preview) return;
+      preview.style.colorScheme = theme.colorScheme || 'light';
+      const keyMap = {
+        bg2: '--preview-bg-2',
+        panelSoft: '--preview-panel-soft',
+        brand2: '--preview-brand-2',
+        qrBg: '--preview-qr-bg',
+      };
       Object.entries(theme).forEach(([key, value]) => {
-        preview.style.setProperty('--preview-' + key, value);
+        if (key === 'colorScheme') return;
+        const variable = keyMap[key] || '--preview-' + key;
+        preview.style.setProperty(variable, value);
       });
     }
     function setPaymentPreviewQr(src) {
@@ -1871,11 +2538,73 @@ function renderAdmin(
         target.appendChild(image);
       });
     }
+    async function submitPaymentQrAsset(body, successMessage) {
+      try {
+        const res = await fetch('/api/admin/payment-qr-assets', { method: 'POST', body });
+        const text = await res.text();
+        if (!res.ok) {
+          showStatus('payment-qr-action-status', text || '操作失败', true);
+          return false;
+        }
+        showStatus('payment-qr-action-status', successMessage);
+        location.reload();
+        return true;
+      } catch (error) {
+        showStatus('payment-qr-action-status', error instanceof Error ? error.message : '网络请求失败', true);
+        return false;
+      }
+    }
+    async function uploadPaymentQrAsset() {
+      const fileInput = document.querySelector('#payment-qr-image-file');
+      const nameInput = document.querySelector('#payment-qr-name');
+      const file = fileInput && fileInput.files && fileInput.files[0];
+      const name = nameInput ? nameInput.value.trim() : '';
+      const body = new FormData();
+      body.set('action', 'upload');
+      if (!file) {
+        showStatus('payment-qr-action-status', '请选择图片文件后再上传。', true);
+        return;
+      }
+      body.set('payment_qr_image_file', file);
+      if (name) body.set('payment_qr_name', name);
+      showStatus('payment-qr-action-status', '正在保存收款码...');
+      await submitPaymentQrAsset(body, '收款码已保存，正在刷新...');
+    }
+    async function uploadPaymentQrAssetFromUrl() {
+      const urlInput = document.querySelector('#payment-qr-url');
+      if (!urlInput || !urlInput.value.trim()) {
+        showStatus('payment-qr-action-status', '请先填写收款码 URL。', true);
+        return;
+      }
+      const nameInput = document.querySelector('#payment-qr-name');
+      const body = new FormData();
+      body.set('action', 'upload');
+      body.set('payment_qr_image_url', urlInput.value.trim());
+      if (nameInput && nameInput.value.trim()) body.set('payment_qr_name', nameInput.value.trim());
+      showStatus('payment-qr-action-status', '正在保存收款码...');
+      await submitPaymentQrAsset(body, '收款码已保存，正在刷新...');
+    }
+    async function selectPaymentQrAsset(id) {
+      const body = new FormData();
+      body.set('action', 'select');
+      body.set('id', String(id));
+      showStatus('payment-qr-action-status', '正在切换收款码...');
+      await submitPaymentQrAsset(body, '收款码已切换，正在刷新...');
+    }
+    async function deletePaymentQrAsset(id) {
+      if (!confirm('确定删除这张收款码吗？')) return;
+      const body = new FormData();
+      body.set('action', 'delete');
+      body.set('id', String(id));
+      showStatus('payment-qr-action-status', '正在删除收款码...');
+      await submitPaymentQrAsset(body, '收款码已删除，正在刷新...');
+    }
     function initPaymentPreviewControls() {
-      const fileInput = document.querySelector('[name="collect_qr_image_file"]');
-      const urlInput = document.querySelector('[name="collect_qr_image_url"]');
+      const fileInput = document.querySelector('#payment-qr-image-file');
+      const urlInput = document.querySelector('#payment-qr-url');
       const themeInput = document.querySelector('[name="payment_page_theme"]');
       const savedQr = ${JSON.stringify(config.collectQrImageUrl)};
+      if (themeInput) setPaymentPreviewTheme(themeInput.value);
       if (fileInput) {
         fileInput.addEventListener('change', () => {
           const file = fileInput.files && fileInput.files[0];
@@ -1891,7 +2620,7 @@ function renderAdmin(
           const reader = new FileReader();
           reader.onload = () => {
             setPaymentPreviewQr(String(reader.result || ''));
-            showStatus('payment-preview-status', '正在预览新图片；点击“保存设置”后才会正式生效。');
+            showStatus('payment-preview-status', '正在预览新图片；点击上方“上传并设为当前”后才会正式生效。');
           };
           reader.readAsDataURL(file);
         });
@@ -1900,7 +2629,7 @@ function renderAdmin(
         urlInput.addEventListener('input', () => {
           const value = urlInput.value.trim();
           setPaymentPreviewQr(value || savedQr);
-          showStatus('payment-preview-status', value ? '正在预览新的图片 URL；点击“保存设置”后才会正式生效。' : savedQr ? '当前展示的是已保存收款码。' : '还没有配置收款码。');
+          showStatus('payment-preview-status', value ? '正在预览新的图片 URL；点击上方“添加 URL 收款码”后才会正式生效。' : savedQr ? '当前展示的是已保存收款码。' : '还没有配置收款码。');
         });
       }
       if (themeInput) {
@@ -1948,8 +2677,6 @@ function settingsForm(config: AppConfig): string {
         ${timeZoneOption(config.timeZone, "America/Los_Angeles", "洛杉矶 America/Los_Angeles")}
       </select>
     </label>
-    <label>订单过期分钟<input name="order_expire_minutes" value="${escapeAttr(config.orderExpireMinutes)}" inputmode="numeric" required></label>
-    <label>金额尾数范围<input name="amount_variance_cents" value="${escapeAttr(config.amountVarianceCents)}" inputmode="numeric" required></label>
     <label>回调 HMAC 密钥，仅 JSON 回调用<input name="callback_secret" type="password" placeholder="${secretPlaceholder(config.callbackSecret)}"></label>
     <label>商户 API Key，仅直连 API 用<input name="merchant_api_key" type="password" placeholder="${secretPlaceholder(config.merchantApiKey)}"></label>
     <label>管理员账号<input name="admin_username" value="${escapeAttr(config.adminUsername)}" autocomplete="username"></label>
@@ -1983,17 +2710,22 @@ function settingsForm(config: AppConfig): string {
 
     <div class="panel" data-panel="payment" hidden style="display:contents;">
     <div class="note wide" style="padding:0;">支付页设置只影响用户扫码付款页面，不影响支付宝开放平台查账。</div>
-    <label>上传新收款码图片，可选<input name="collect_qr_image_file" type="file" accept="image/png,image/jpeg,image/webp"></label>
-    <label>收款码图片 URL，已有图床才填<input name="collect_qr_image_url" value="${config.collectQrImageUrl.startsWith("data:image/") ? "" : escapeAttr(config.collectQrImageUrl)}" placeholder="${config.collectQrImageUrl ? "已配置，上传新图片或填新 URL 可替换" : "https://.../alipay-qr.png"}"></label>
+    <label>订单过期分钟<input name="order_expire_minutes" value="${escapeAttr(config.orderExpireMinutes)}" inputmode="numeric" required></label>
+    <label>金额尾数范围<input name="amount_variance_cents" value="${escapeAttr(config.amountVarianceCents)}" inputmode="numeric" required></label>
+    ${paymentQrAssetsMarkup(config)}
     <label>支付页主题
       <select name="payment_page_theme">
         ${paymentThemeOption(config.paymentPageTheme, "alipay", "支付宝蓝")}
         ${paymentThemeOption(config.paymentPageTheme, "minimal", "简洁白")}
+        ${paymentThemeOption(config.paymentPageTheme, "pearl", "珍珠白")}
+        ${paymentThemeOption(config.paymentPageTheme, "aurora", "极光蓝")}
+        ${paymentThemeOption(config.paymentPageTheme, "graphite", "石墨灰")}
+        ${paymentThemeOption(config.paymentPageTheme, "midnight", "深夜蓝")}
         ${paymentThemeOption(config.paymentPageTheme, "dark", "暗色")}
         ${paymentThemeOption(config.paymentPageTheme, "warm", "暖色")}
       </select>
     </label>
-    <div id="payment-preview-status" class="action-status wide">${config.collectQrImageUrl ? "已保存收款码，文件框刷新后显示未选择是浏览器限制。" : "还没有配置收款码，上传图片或填写 URL 后可在下方预览。"}</div>
+    <div id="payment-preview-status" class="action-status wide">${config.collectQrImageUrl ? "当前已有可用收款码，下面预览会显示当前选中的资产。" : "还没有配置收款码，先上传或添加一张再预览。"}</div>
     ${paymentSettingsPreview(config)}
     </div>
 
@@ -2032,20 +2764,30 @@ function settingsForm(config: AppConfig): string {
     </div>
 
     <button type="submit">保存设置</button>
-    <div class="note wide">密钥类字段留空表示不修改；易支付接入只需要配置易支付 PID 和易支付 Key。商户 API Key 只给直接调用 /api/orders 的程序用。</div>
+    <div class="note wide">密钥类字段留空表示不修改；易支付接入只需要配置易支付 PID 和易支付 Key。商户 API Key 只给直接调用 /api/orders 的程序用。订单过期分钟和金额尾数范围已放到支付页设置里。</div>
   </form>`;
 }
 
 function paymentSettingsPreview(config: AppConfig): string {
   const theme = paymentTheme(config.paymentPageTheme);
+  const activeAsset = config.paymentQrAssets.find((asset) => String(asset.id) === config.collectQrAssetId) || null;
+  const activeLabel = activeAsset
+    ? `${activeAsset.name || "未命名"} · ${paymentQrAssetSourceLabel(activeAsset.source)}`
+    : config.collectQrImageUrl
+      ? "备用 URL"
+      : "未配置";
   const previewStyle = [
     `--preview-bg:${theme.bg}`,
+    `--preview-bg-2:${theme.bg2}`,
     `--preview-panel:${theme.panel}`,
+    `--preview-panel-soft:${theme.panelSoft}`,
     `--preview-text:${theme.text}`,
     `--preview-muted:${theme.muted}`,
     `--preview-line:${theme.line}`,
     `--preview-brand:${theme.brand}`,
+    `--preview-brand-2:${theme.brand2}`,
     `--preview-accent:${theme.accent}`,
+    `--preview-qr-bg:${theme.qrBg}`,
     `--preview-radius:${theme.radius}`,
     `--preview-shadow:${theme.shadow}`,
   ].join(";");
@@ -2053,8 +2795,9 @@ function paymentSettingsPreview(config: AppConfig): string {
   return `<div class="payment-preview-grid">
     <div class="preview-card">
       <strong>当前收款码</strong>
+      <div class="note" style="padding:0;">当前选中：${escapeHtml(activeLabel)}</div>
       <div class="saved-qr-frame" data-payment-qr-target>${qrPreview}</div>
-      <div class="note" style="padding:0;">保存后文件选择框会重新显示“未选择文件”，请以下方预览判断当前配置。</div>
+      <div class="note" style="padding:0;">这里显示的是当前实际生效的收款码，删除或切换后会立刻更新。</div>
     </div>
     <div class="preview-card">
       <strong>支付页预览</strong>
@@ -2083,6 +2826,60 @@ function paymentQrPreview(src: string): string {
     : `<div>未配置收款码</div>`;
 }
 
+function paymentQrAssetSourceLabel(source: string): string {
+  if (source === "upload") return "本地上传";
+  if (source === "url") return "外链";
+  return source || "未知来源";
+}
+
+function paymentQrAssetsMarkup(config: AppConfig): string {
+  const activeAsset = config.paymentQrAssets.find((asset) => String(asset.id) === config.collectQrAssetId) || null;
+  const activeLabel = activeAsset
+    ? `${activeAsset.name || "未命名"} · ${paymentQrAssetSourceLabel(activeAsset.source)}`
+    : config.collectQrImageUrl
+      ? "备用 URL"
+      : "未配置";
+  const assetRows = config.paymentQrAssets.length
+    ? config.paymentQrAssets
+        .map((row) => {
+          const isActive = String(row.id) === config.collectQrAssetId;
+          return `<div class="qr-asset${isActive ? " active" : ""}">
+            <img src="${escapeAttr(row.value)}" alt="${escapeAttr(row.name || "收款码")}" loading="lazy">
+            <div class="qr-asset-body">
+              <strong>${escapeHtml(row.name || "未命名收款码")}</strong>
+              <div class="qr-asset-meta">
+                <span>${escapeHtml(paymentQrAssetSourceLabel(row.source))}</span>
+                <span>${escapeHtml(row.mime_type || "未知类型")}</span>
+                <span>更新 ${escapeHtml(shortDate(row.updated_at, config.timeZone))}</span>
+              </div>
+            </div>
+            <div class="qr-asset-actions">
+              ${isActive ? `<span class="pill paid">当前使用</span>` : `<button type="button" class="secondary" onclick="selectPaymentQrAsset(${row.id})">设为当前</button>`}
+              <button type="button" class="secondary danger" onclick="deletePaymentQrAsset(${row.id})">删除</button>
+            </div>
+          </div>`;
+        })
+        .join("")
+    : `<div class="qr-empty">还没有收款码资产，先上传一张，或者填一个 URL。</div>`;
+  return `<div class="qr-manager">
+    <div class="qr-manager-head">
+      <strong>收款码资产管理</strong>
+      <span>当前使用：${escapeHtml(activeLabel)}</span>
+    </div>
+    <div class="qr-upload-grid">
+      <label>收款码名称<input id="payment-qr-name" placeholder="例如：主收款码"></label>
+      <label>选择图片文件<input id="payment-qr-image-file" type="file" accept="image/png,image/jpeg,image/webp"></label>
+      <button type="button" onclick="uploadPaymentQrAsset()">上传并设为当前</button>
+      <label class="wide">或者填写收款码 URL<input id="payment-qr-url" placeholder="https://.../alipay-qr.png"></label>
+      <button type="button" onclick="uploadPaymentQrAssetFromUrl()">添加 URL 收款码</button>
+    </div>
+    <div id="payment-qr-action-status" class="action-status"></div>
+    <div class="qr-asset-list">
+      ${assetRows}
+    </div>
+  </div>`;
+}
+
 function loginPage(config: AppConfig, hasError: boolean): string {
   return `<!doctype html>
 <html lang="zh-CN">
@@ -2091,19 +2888,97 @@ function loginPage(config: AppConfig, hasError: boolean): string {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(config.appName)} 登录</title>
   <style>
-    body { margin:0; min-height:100vh; display:grid; place-items:center; background:#f6f8fb; color:#1f2937; font:15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    main { width:min(380px, calc(100vw - 32px)); background:#fff; border:1px solid #dfe5ee; border-radius:8px; padding:24px; box-shadow:0 12px 40px rgba(15,23,42,.08); }
-    h1 { margin:0 0 18px; font-size:20px; text-align:center; }
+    :root { --bg:#edf3fb; --bg-2:#f8fbff; --panel:#ffffff; --text:#0f172a; --muted:#5b6474; --line:#d8e1ee; --brand:#265cf0; --brand-2:#4f8cff; }
+    * { box-sizing:border-box; }
+    body {
+      margin:0;
+      min-height:100vh;
+      display:grid;
+      place-items:center;
+      padding:32px 16px;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(38,92,240,.16), transparent 28%),
+        radial-gradient(circle at 88% 10%, rgba(79,140,255,.12), transparent 24%),
+        linear-gradient(180deg, var(--bg-2), var(--bg));
+      color:var(--text);
+      font:15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      position:relative;
+    }
+    body::before {
+      content:"";
+      position:fixed;
+      inset:0;
+      background-image:linear-gradient(rgba(15,23,42,.022) 1px, transparent 1px), linear-gradient(90deg, rgba(15,23,42,.022) 1px, transparent 1px);
+      background-size:72px 72px;
+      mask-image:linear-gradient(180deg, rgba(0,0,0,.65), transparent 92%);
+      pointer-events:none;
+    }
+    main {
+      width:min(420px, calc(100vw - 32px));
+      background:rgba(255,255,255,.9);
+      border:1px solid rgba(216,225,238,.92);
+      border-radius:24px;
+      padding:28px;
+      box-shadow:0 24px 70px rgba(15,23,42,.10);
+      backdrop-filter: blur(16px);
+    }
+    .brand { display:grid; gap:10px; justify-items:center; margin-bottom:22px; text-align:center; }
+    .brand-mark {
+      width:54px;
+      height:54px;
+      border-radius:18px;
+      display:grid;
+      place-items:center;
+      color:#fff;
+      background:linear-gradient(135deg, var(--brand), var(--brand-2));
+      box-shadow:0 16px 34px rgba(38,92,240,.24);
+      font-size:26px;
+      font-weight:900;
+    }
+    h1 { margin:0; font-size:24px; text-align:center; letter-spacing:.02em; }
+    .subtitle { color:var(--muted); text-align:center; }
     form { display:grid; gap:12px; }
-    label { display:grid; gap:6px; color:#667085; font-size:13px; }
-    input { width:100%; min-height:40px; border:1px solid #dfe5ee; border-radius:6px; padding:0 10px; font:inherit; color:#1f2937; }
-    button { min-height:40px; border:0; border-radius:6px; background:#2563eb; color:white; font-weight:700; cursor:pointer; }
-    .error { margin:0 0 12px; color:#b42318; text-align:center; }
+    label { display:grid; gap:6px; color:var(--muted); font-size:13px; }
+    input {
+      width:100%;
+      min-height:42px;
+      border:1px solid var(--line);
+      border-radius:12px;
+      padding:0 12px;
+      font:inherit;
+      color:var(--text);
+      background:#fff;
+    }
+    input:focus { outline:none; border-color:rgba(38,92,240,.5); box-shadow:0 0 0 4px rgba(38,92,240,.10); }
+    button {
+      min-height:42px;
+      border:0;
+      border-radius:12px;
+      background:linear-gradient(135deg, var(--brand), var(--brand-2));
+      color:white;
+      font-weight:800;
+      cursor:pointer;
+      box-shadow:0 12px 24px rgba(38,92,240,.18);
+    }
+    .error {
+      margin:0 0 12px;
+      color:#b42318;
+      text-align:center;
+      background:#fff7f5;
+      border:1px solid rgba(180,35,24,.14);
+      border-radius:12px;
+      padding:10px 12px;
+      font-weight:650;
+    }
   </style>
 </head>
 <body>
   <main>
-    <h1>${escapeHtml(config.appName)}</h1>
+    <div class="brand">
+      <div class="brand-mark">支</div>
+      <h1>${escapeHtml(config.appName)}</h1>
+      <div class="subtitle">安全支付后台登录</div>
+    </div>
     ${hasError ? `<p class="error">账号或密码错误</p>` : ""}
     <form method="post" action="/admin/login">
       <label>管理员账号<input name="username" autocomplete="username" required autofocus></label>
@@ -2123,19 +2998,86 @@ function setupPage(config: AppConfig): string {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(config.appName)} 初始化</title>
   <style>
-    body { margin:0; min-height:100vh; display:grid; place-items:center; background:#f6f8fb; color:#1f2937; font:15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    main { width:min(420px, calc(100vw - 32px)); background:#fff; border:1px solid #dfe5ee; border-radius:8px; padding:24px; box-shadow:0 12px 40px rgba(15,23,42,.08); }
-    h1 { margin:0 0 8px; font-size:20px; text-align:center; }
-    p { margin:0 0 18px; color:#667085; text-align:center; }
+    :root { --bg:#edf3fb; --bg-2:#f8fbff; --panel:#ffffff; --text:#0f172a; --muted:#5b6474; --line:#d8e1ee; --brand:#265cf0; --brand-2:#4f8cff; }
+    * { box-sizing:border-box; }
+    body {
+      margin:0;
+      min-height:100vh;
+      display:grid;
+      place-items:center;
+      padding:32px 16px;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(38,92,240,.16), transparent 28%),
+        radial-gradient(circle at 88% 10%, rgba(79,140,255,.12), transparent 24%),
+        linear-gradient(180deg, var(--bg-2), var(--bg));
+      color:var(--text);
+      font:15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      position:relative;
+    }
+    body::before {
+      content:"";
+      position:fixed;
+      inset:0;
+      background-image:linear-gradient(rgba(15,23,42,.022) 1px, transparent 1px), linear-gradient(90deg, rgba(15,23,42,.022) 1px, transparent 1px);
+      background-size:72px 72px;
+      mask-image:linear-gradient(180deg, rgba(0,0,0,.65), transparent 92%);
+      pointer-events:none;
+    }
+    main {
+      width:min(440px, calc(100vw - 32px));
+      background:rgba(255,255,255,.9);
+      border:1px solid rgba(216,225,238,.92);
+      border-radius:24px;
+      padding:28px;
+      box-shadow:0 24px 70px rgba(15,23,42,.10);
+      backdrop-filter: blur(16px);
+    }
+    .brand { display:grid; gap:10px; justify-items:center; margin-bottom:22px; text-align:center; }
+    .brand-mark {
+      width:54px;
+      height:54px;
+      border-radius:18px;
+      display:grid;
+      place-items:center;
+      color:#fff;
+      background:linear-gradient(135deg, var(--brand), var(--brand-2));
+      box-shadow:0 16px 34px rgba(38,92,240,.24);
+      font-size:26px;
+      font-weight:900;
+    }
+    h1 { margin:0; font-size:24px; text-align:center; letter-spacing:.02em; }
+    p { margin:0 0 18px; color:var(--muted); text-align:center; }
     form { display:grid; gap:12px; }
-    label { display:grid; gap:6px; color:#667085; font-size:13px; }
-    input { width:100%; min-height:40px; border:1px solid #dfe5ee; border-radius:6px; padding:0 10px; font:inherit; color:#1f2937; }
-    button { min-height:40px; border:0; border-radius:6px; background:#2563eb; color:white; font-weight:700; cursor:pointer; }
+    label { display:grid; gap:6px; color:var(--muted); font-size:13px; }
+    input {
+      width:100%;
+      min-height:42px;
+      border:1px solid var(--line);
+      border-radius:12px;
+      padding:0 12px;
+      font:inherit;
+      color:var(--text);
+      background:#fff;
+    }
+    input:focus { outline:none; border-color:rgba(38,92,240,.5); box-shadow:0 0 0 4px rgba(38,92,240,.10); }
+    button {
+      min-height:42px;
+      border:0;
+      border-radius:12px;
+      background:linear-gradient(135deg, var(--brand), var(--brand-2));
+      color:white;
+      font-weight:800;
+      cursor:pointer;
+      box-shadow:0 12px 24px rgba(38,92,240,.18);
+    }
   </style>
 </head>
 <body>
   <main>
-    <h1>创建管理员</h1>
+    <div class="brand">
+      <div class="brand-mark">支</div>
+      <h1>创建管理员</h1>
+    </div>
     <p>首次部署后创建后台账号，只能初始化一次。</p>
     <form method="post" action="/admin/setup">
       <label>管理员账号<input name="username" autocomplete="username" required autofocus></label>
@@ -2182,6 +3124,29 @@ function timeZoneOption(current: string, value: string, label: string): string {
 
 function paymentThemeOption(current: string, value: string, label: string): string {
   return `<option value="${escapeAttr(value)}"${current === value ? " selected" : ""}>${escapeHtml(label)}</option>`;
+}
+
+function paymentThemeLabel(value: string): string {
+  switch (value) {
+    case "alipay":
+      return "支付宝蓝";
+    case "minimal":
+      return "简洁白";
+    case "pearl":
+      return "珍珠白";
+    case "aurora":
+      return "极光蓝";
+    case "graphite":
+      return "石墨灰";
+    case "midnight":
+      return "深夜蓝";
+    case "dark":
+      return "暗色";
+    case "warm":
+      return "暖色";
+    default:
+      return value || "未命名主题";
+  }
 }
 
 type TableCell = string | { html: string };
@@ -2538,7 +3503,7 @@ function assertTimeZone(value: string): void {
 }
 
 function assertPaymentTheme(value: string): void {
-  if (!["alipay", "minimal", "dark", "warm"].includes(value)) {
+  if (!["alipay", "minimal", "pearl", "aurora", "graphite", "dark", "warm", "midnight"].includes(value)) {
     throw new HttpError(400, "payment_page_theme is invalid");
   }
 }
