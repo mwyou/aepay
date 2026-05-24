@@ -1572,6 +1572,10 @@ function renderAdmin(
         .replace('-----END PUBLIC KEY-----', '')
         .replace(/\\s+/g, '');
     }
+    function previewSecretText(value) {
+      if (!value) return '未配置';
+      return value.length <= 10 ? value : value.slice(0, 4) + '...' + value.slice(-4);
+    }
     async function generateAlipayKeyPair() {
       const pair = await crypto.subtle.generateKey(
         {
@@ -1588,15 +1592,17 @@ function renderAdmin(
       const privatePem = pemFromBase64(btoa(String.fromCharCode(...new Uint8Array(privateKey))), 'PRIVATE KEY');
       const publicPem = pemFromBase64(btoa(String.fromCharCode(...new Uint8Array(publicKey))), 'PUBLIC KEY');
       const privateInput = document.querySelector('[name="alipay_private_key_pem"]');
+      const privatePreview = document.querySelector('#alipay-app-private-key-preview');
       const publicHidden = document.querySelector('[name="alipay_app_public_key_text"]');
-      const publicOutput = document.querySelector('#alipay-app-public-key-text');
+      const publicPreview = document.querySelector('#alipay-app-public-key-preview');
       const publicText = alipayPublicKeyText(publicPem);
       if (privateInput) privateInput.value = privatePem;
+      if (privatePreview) privatePreview.textContent = previewSecretText(alipayPrivateKeyText(privatePem));
       if (publicHidden) publicHidden.value = publicText;
-      if (publicOutput) publicOutput.value = publicText;
+      if (publicPreview) publicPreview.textContent = previewSecretText(publicText);
     }
     async function copyAlipayPublicKey() {
-      const output = document.querySelector('#alipay-app-public-key-text');
+      const output = document.querySelector('[name="alipay_app_public_key_text"]');
       if (!output || !output.value) {
         alert('请先生成支付宝应用密钥对');
         return;
@@ -1714,9 +1720,9 @@ function settingsForm(config: AppConfig): string {
       <button type="button" onclick="generateAlipayKeyPair()">生成支付宝应用密钥对</button>
       <button type="button" onclick="copyAlipayPublicKey()">复制支付宝后台专用公钥</button>
     </div>
-    <div class="note wide" style="padding:0;">当前应用公钥：${secretPreview(config.alipayAppPublicKeyText)} ${config.alipayAppPublicKeyText ? `<button type="button" onclick="copyAlipayPublicKey()">复制应用公钥</button>` : ""}</div>
-    <label class="wide">应用公钥，复制到支付宝开放平台<textarea id="alipay-app-public-key-text" readonly placeholder="点击“生成支付宝应用密钥对”后这里会出现一整行公钥字符串">${escapeHtml(config.alipayAppPublicKeyText)}</textarea></label>
-    <label class="wide">支付宝应用私钥 PEM，查账必填<textarea name="alipay_private_key_pem" placeholder="${secretPlaceholder(config.alipayPrivateKeyPem)}"></textarea></label>
+    <div class="note wide" style="padding:0;">当前应用私钥：<span id="alipay-app-private-key-preview">${secretPreview(alipayPrivateKeyText(config.alipayPrivateKeyPem))}</span></div>
+    <input name="alipay_private_key_pem" type="hidden" value="">
+    <div class="note wide" style="padding:0;">当前应用公钥：<span id="alipay-app-public-key-preview">${secretPreview(config.alipayAppPublicKeyText)}</span> ${config.alipayAppPublicKeyText ? `<button type="button" onclick="copyAlipayPublicKey()">复制应用公钥</button>` : ""}</div>
     <div class="note wide" style="padding:0; font-weight:700; color:#1f2937;">支付宝平台公钥：从支付宝开放平台复制到这里，用于通知验签。它不是上面的应用公钥。</div>
     <div class="note wide" style="padding:0;">当前支付宝公钥：${secretPreview(publicKeyText(config.alipayPublicKeyPem))} ${config.alipayPublicKeyPem ? `<button type="button" onclick="copyText('${escapeJs(publicKeyText(config.alipayPublicKeyPem))}')">复制支付宝公钥</button>` : ""}</div>
     <label class="wide">支付宝公钥<textarea name="alipay_public_key_text" placeholder="粘贴支付宝开放平台提供的支付宝公钥字符串，保存时会自动处理格式"></textarea></label>
@@ -1806,6 +1812,13 @@ function publicKeyText(value: string): string {
   return value
     .replace(/-----BEGIN PUBLIC KEY-----/g, "")
     .replace(/-----END PUBLIC KEY-----/g, "")
+    .replace(/\s+/g, "");
+}
+
+function alipayPrivateKeyText(value: string): string {
+  return value
+    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----END PRIVATE KEY-----/g, "")
     .replace(/\s+/g, "");
 }
 
