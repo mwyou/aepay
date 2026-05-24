@@ -236,6 +236,7 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
   const now = new Date().toISOString();
   const uploadedQrImage = await uploadedImageDataUrl(form, "collect_qr_image_file");
   const collectQrImageUrl = uploadedQrImage || stringForm(form, "collect_qr_image_url") || config.collectQrImageUrl;
+  const alipayPublicKeyInput = stringForm(form, "alipay_public_key_text") || stringForm(form, "alipay_public_key_pem");
   const plain: Record<string, string> = {
     app_name: stringForm(form, "app_name"),
     time_zone: stringForm(form, "time_zone") || "Asia/Shanghai",
@@ -277,7 +278,7 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
     "alipay_public_key_pem",
   ];
   for (const key of secrets) {
-    const value = stringForm(form, key);
+    const value = key === "alipay_public_key_pem" ? normalizePublicKeyPem(alipayPublicKeyInput) : stringForm(form, key);
     if (value.trim() !== "") await upsertSetting(env, key, value, true, now);
   }
 
@@ -378,6 +379,14 @@ async function uploadedImageDataUrl(form: FormData, key: string): Promise<string
     throw new HttpError(400, "收款码图片不能超过 750KB");
   }
   return `data:${value.type};base64,${arrayBufferToBase64(await value.arrayBuffer())}`;
+}
+
+function normalizePublicKeyPem(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed.includes("-----BEGIN PUBLIC KEY-----")) return trimmed;
+  const compact = trimmed.replace(/\s+/g, "");
+  return `-----BEGIN PUBLIC KEY-----\n${compact.match(/.{1,64}/g)?.join("\n") || compact}\n-----END PUBLIC KEY-----`;
 }
 
 async function createOrder(request: Request, env: Env, config: AppConfig): Promise<Response> {
@@ -1305,6 +1314,7 @@ function paymentTheme(name: string): {
 function renderPaymentPage(config: AppConfig, order: OrderRow): string {
   const done = order.status === "paid";
   const theme = paymentTheme(config.paymentPageTheme);
+  const expiresAtMs = new Date(order.expires_at).getTime();
   const qr = config.collectQrImageUrl
     ? `<img class="qr" src="${escapeHtml(config.collectQrImageUrl)}" alt="支付宝收款码">`
     : `<div class="empty">未配置收款码图片，请向商户索取支付宝收款码。</div>`;
@@ -1328,22 +1338,76 @@ function renderPaymentPage(config: AppConfig, order: OrderRow): string {
     .meta { margin-top:16px; color:var(--muted); font-size:13px; text-align:left; display:grid; gap:6px; }
     .meta div { display:flex; justify-content:space-between; gap:12px; border-bottom:1px solid var(--line); padding-bottom:6px; }
     .meta div:last-child { border-bottom:0; padding-bottom:0; }
+    .timer { margin:0 0 16px; min-height:32px; display:flex; align-items:center; justify-content:center; gap:8px; border:1px solid var(--line); border-radius:${theme.radius}; color:var(--muted); background:rgba(255,255,255,.35); font-weight:700; }
+    .timer strong { color:var(--accent); }
+    .hint { margin:12px 0 0; color:var(--muted); font-size:13px; }
     .paid { color:var(--ok); font-weight:750; }
+    .expired { color:#b42318; font-weight:750; }
   </style>
 </head>
 <body>
   <main>
     <div class="brand">支</div>
-    <h1>${escapeHtml(done ? "支付已确认" : "支付宝扫码付款")}</h1>
-    <div class="amount">¥${escapeHtml(order.pay_amount)}</div>
-    ${done ? `<p class="paid">订单已到账，无需重复支付。</p>` : `<div class="qr-wrap">${qr}</div>`}
+    <h1 id="title">${escapeHtml(done ? "支付已确认" : "支付宝扫码付款")}</h1>
+    <div class="amount" id="amount">¥${escapeHtml(order.pay_amount)}</div>
+    <div class="timer" id="timer" ${done ? "hidden" : ""}>剩余支付时间 <strong>--:--</strong></div>
+    <div id="pay-state">${done ? `<p class="paid">订单已到账，无需重复支付。</p>` : `<div class="qr-wrap">${qr}</div><p class="hint">请按页面金额付款，付款后将自动确认。</p>`}</div>
     <div class="meta">
       <div><span>订单号</span><strong>${escapeHtml(order.merchant_order_no)}</strong></div>
       <div><span>商品</span><strong>${escapeHtml(order.subject || "-")}</strong></div>
-      <div><span>状态</span><strong>${escapeHtml(order.status)}</strong></div>
+      <div><span>状态</span><strong id="status">${escapeHtml(order.status)}</strong></div>
       <div><span>过期时间</span><strong>${escapeHtml(shortDate(order.expires_at, config.timeZone))}</strong></div>
     </div>
   </main>
+  <script>
+    const orderNo = ${JSON.stringify(order.merchant_order_no)};
+    const expiresAt = ${Number.isFinite(expiresAtMs) ? expiresAtMs : 0};
+    const timer = document.querySelector('#timer');
+    const statusEl = document.querySelector('#status');
+    const title = document.querySelector('#title');
+    const payState = document.querySelector('#pay-state');
+
+    function renderPaid() {
+      title.textContent = '支付已确认';
+      statusEl.textContent = 'paid';
+      if (timer) timer.hidden = true;
+      payState.innerHTML = '<p class="paid">订单已到账，无需重复支付。</p>';
+    }
+
+    function renderExpired() {
+      title.textContent = '订单已过期';
+      statusEl.textContent = 'expired';
+      if (timer) timer.innerHTML = '<span class="expired">订单已过期，请重新下单</span>';
+      payState.innerHTML = '<p class="expired">请不要继续付款，重新创建订单后再支付。</p>';
+    }
+
+    function tick() {
+      if (!timer || timer.hidden || !expiresAt) return;
+      const left = expiresAt - Date.now();
+      if (left <= 0) {
+        renderExpired();
+        return;
+      }
+      const total = Math.ceil(left / 1000);
+      const minutes = Math.floor(total / 60);
+      const seconds = total % 60;
+      timer.innerHTML = '剩余支付时间 <strong>' + String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0') + '</strong>';
+    }
+
+    async function pollStatus() {
+      if (statusEl.textContent === 'paid' || statusEl.textContent === 'expired') return;
+      try {
+        const res = await fetch('/api/orders/' + encodeURIComponent(orderNo), { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.status === 'paid') renderPaid();
+      } catch {}
+    }
+
+    tick();
+    setInterval(tick, 1000);
+    setInterval(pollStatus, 3000);
+  </script>
 </body>
 </html>`;
 }
@@ -1649,7 +1713,8 @@ function settingsForm(config: AppConfig): string {
     <label class="wide">支付宝后台专用应用公钥，复制到支付宝开放平台<textarea id="alipay-app-public-key-text" readonly placeholder="点击“生成支付宝应用密钥对”后这里会出现一整行公钥字符串，不含头尾和换行">${escapeHtml(config.alipayAppPublicKeyText)}</textarea></label>
     <label class="wide">应用公钥 PEM，仅备用查看<textarea id="alipay-app-public-key-pem" readonly placeholder="这里是 PEM 格式，通常不要粘到支付宝后台"></textarea></label>
     <label class="wide">支付宝应用私钥 PEM，查账必填<textarea name="alipay_private_key_pem" placeholder="${secretPlaceholder(config.alipayPrivateKeyPem)}"></textarea></label>
-    <label class="wide">支付宝公钥 PEM，通知验签用<textarea name="alipay_public_key_pem" placeholder="${secretPlaceholder(config.alipayPublicKeyPem)}"></textarea></label>
+    <div class="note wide" style="padding:0;">当前支付宝公钥：${secretPreview(publicKeyText(config.alipayPublicKeyPem))} ${config.alipayPublicKeyPem ? `<button type="button" onclick="copyText('${escapeJs(publicKeyText(config.alipayPublicKeyPem))}')">复制支付宝公钥</button>` : ""}</div>
+    <label class="wide">支付宝公钥字符串，通知验签用<textarea name="alipay_public_key_text" placeholder="粘贴支付宝开放平台提供的支付宝公钥；可带或不带 BEGIN/END，保存时会自动处理"></textarea></label>
     </div>
 
     <button type="submit">保存设置</button>
@@ -1730,6 +1795,13 @@ function secretPreview(value: string): string {
   if (!value) return "未配置";
   if (value.length <= 10) return escapeHtml(value);
   return `${escapeHtml(value.slice(0, 4))}...${escapeHtml(value.slice(-4))}`;
+}
+
+function publicKeyText(value: string): string {
+  return value
+    .replace(/-----BEGIN PUBLIC KEY-----/g, "")
+    .replace(/-----END PUBLIC KEY-----/g, "")
+    .replace(/\s+/g, "");
 }
 
 function escapeJs(value: string): string {
