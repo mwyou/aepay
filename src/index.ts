@@ -145,6 +145,9 @@ export default {
       if (url.pathname === "/api/admin/settings" && request.method === "POST") {
         return await requireAdmin(request, env, config, () => updateSettings(request, env, config));
       }
+      if (url.pathname === "/api/admin/reset" && request.method === "POST") {
+        return await requireAdmin(request, env, config, () => resetSystem(request, env));
+      }
       if (url.pathname === "/api/admin/polling/run" && request.method === "POST") {
         return await requireAdmin(request, env, config, () => runPollingNow(env, config));
       }
@@ -294,6 +297,66 @@ async function upsertSetting(env: Env, key: string, value: string, isSecret: boo
   )
     .bind(key, value, isSecret ? 1 : 0, updatedAt)
     .run();
+}
+
+async function resetSystem(request: Request, env: Env): Promise<Response> {
+  const form = await request.formData();
+  if (stringForm(form, "confirm") !== "RESET") {
+    throw new HttpError(400, "请输入 RESET 确认重置");
+  }
+  const keepAdmin = stringForm(form, "keep_admin") !== "false";
+  const adminUsername = keepAdmin
+    ? await env.DB.prepare("SELECT value FROM system_settings WHERE key = 'admin_username'").first<{ value: string }>()
+    : null;
+  const adminPasswordHash = keepAdmin
+    ? await env.DB.prepare("SELECT value FROM system_settings WHERE key = 'admin_password_hash'").first<{ value: string }>()
+    : null;
+
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM callback_logs"),
+    env.DB.prepare("DELETE FROM payment_events"),
+    env.DB.prepare("DELETE FROM alipay_transactions"),
+    env.DB.prepare("DELETE FROM polling_runs"),
+    env.DB.prepare("DELETE FROM orders"),
+    env.DB.prepare("DELETE FROM system_settings"),
+  ]);
+  await seedDefaultSettings(env);
+  if (keepAdmin && adminUsername?.value && adminPasswordHash?.value) {
+    const now = new Date().toISOString();
+    await upsertSetting(env, "admin_username", adminUsername.value, true, now);
+    await upsertSetting(env, "admin_password_hash", adminPasswordHash.value, true, now);
+  }
+  return Response.redirect(new URL(keepAdmin ? "/admin?reset=1" : "/admin/setup", request.url), 302);
+}
+
+async function seedDefaultSettings(env: Env): Promise<void> {
+  const now = new Date().toISOString();
+  const defaults: Array<[string, string, boolean]> = [
+    ["app_name", "AEPay", false],
+    ["time_zone", "Asia/Shanghai", false],
+    ["order_expire_minutes", "15", false],
+    ["amount_variance_cents", "30", false],
+    ["collect_account", "", false],
+    ["collect_qr_image_url", "", false],
+    ["payment_page_theme", "alipay", false],
+    ["alipay_poll_enabled", "false", false],
+    ["alipay_poll_method", "alipay.data.bill.accountlog.query", false],
+    ["alipay_poll_window_minutes", "10", false],
+    ["alipay_gateway_url", "https://openapi.alipay.com/gateway.do", false],
+    ["alipay_app_id", "", true],
+    ["alipay_private_key_pem", "", true],
+    ["alipay_notify_verify_required", "true", false],
+    ["alipay_public_key_pem", "", true],
+    ["callback_secret", "", true],
+    ["merchant_api_key", "", true],
+    ["epay_pid", "1000", false],
+    ["epay_key", "", true],
+    ["admin_username", "", true],
+    ["admin_password_hash", "", true],
+  ];
+  for (const [key, value, isSecret] of defaults) {
+    await upsertSetting(env, key, value, isSecret, now);
+  }
 }
 
 function stringForm(form: FormData, key: string): string {
@@ -1434,6 +1497,12 @@ function renderAdmin(
       const lines = base64.match(/.{1,64}/g) || [];
       return '-----BEGIN ' + type + '-----\\n' + lines.join('\\n') + '\\n-----END ' + type + '-----';
     }
+    function alipayPublicKeyText(publicPem) {
+      return publicPem
+        .replace('-----BEGIN PUBLIC KEY-----', '')
+        .replace('-----END PUBLIC KEY-----', '')
+        .replace(/\\s+/g, '');
+    }
     async function generateAlipayKeyPair() {
       const pair = await crypto.subtle.generateKey(
         {
@@ -1450,18 +1519,41 @@ function renderAdmin(
       const privatePem = pemFromBase64(btoa(String.fromCharCode(...new Uint8Array(privateKey))), 'PRIVATE KEY');
       const publicPem = pemFromBase64(btoa(String.fromCharCode(...new Uint8Array(publicKey))), 'PUBLIC KEY');
       const privateInput = document.querySelector('[name="alipay_private_key_pem"]');
-      const publicOutput = document.querySelector('#alipay-app-public-key');
+      const publicOutput = document.querySelector('#alipay-app-public-key-text');
+      const pemOutput = document.querySelector('#alipay-app-public-key-pem');
       if (privateInput) privateInput.value = privatePem;
-      if (publicOutput) publicOutput.value = publicPem;
+      if (publicOutput) publicOutput.value = alipayPublicKeyText(publicPem);
+      if (pemOutput) pemOutput.value = publicPem;
     }
     async function copyAlipayPublicKey() {
-      const output = document.querySelector('#alipay-app-public-key');
+      const output = document.querySelector('#alipay-app-public-key-text');
       if (!output || !output.value) {
         alert('请先生成支付宝应用密钥对');
         return;
       }
       await navigator.clipboard.writeText(output.value);
-      alert('已复制应用公钥，请粘贴到支付宝开放平台的“应用公钥”配置里');
+      alert('已复制支付宝后台专用应用公钥字符串');
+    }
+    async function resetSystem() {
+      const confirmInput = document.querySelector('#reset-confirm');
+      const keepAdmin = document.querySelector('#reset-keep-admin');
+      const confirmValue = confirmInput ? confirmInput.value.trim() : '';
+      if (confirmValue !== 'RESET') {
+        alert('请输入 RESET 确认重置');
+        return;
+      }
+      if (!confirm('确认重置系统？订单、到账、查账和回调日志会被清空。')) return;
+      const body = new FormData();
+      body.set('confirm', confirmValue);
+      body.set('keep_admin', keepAdmin && keepAdmin.checked ? 'true' : 'false');
+      const res = await fetch('/api/admin/reset', { method: 'POST', body });
+      if (res.redirected) {
+        location.href = res.url;
+        return;
+      }
+      const text = await res.text();
+      if (!res.ok) alert(text);
+      else location.reload();
     }
   </script>
 </body>
@@ -1491,6 +1583,15 @@ function settingsForm(config: AppConfig): string {
     <div class="wide" style="display:flex; flex-wrap:wrap; gap:10px;">
       <button type="button" onclick="fillSecret('callback_secret')">生成回调 HMAC 密钥</button>
       <button type="button" onclick="fillSecret('merchant_api_key')">生成商户 API Key</button>
+    </div>
+    <div class="wide" style="border:1px solid #f3b4ad; border-radius:8px; padding:14px; background:#fff7f6; display:grid; gap:10px;">
+      <strong style="color:#b42318;">危险操作</strong>
+      <div class="note" style="padding:0;">重置会清空订单、到账事件、支付宝流水、查账日志、回调日志，并恢复所有业务配置默认值。默认保留当前管理员账号。</div>
+      <div style="display:grid; grid-template-columns:minmax(180px,260px) auto auto; gap:10px; align-items:end;">
+        <label>输入 RESET 确认<input id="reset-confirm" autocomplete="off"></label>
+        <label style="display:flex; align-items:center; gap:8px; color:#667085;"><input id="reset-keep-admin" type="checkbox" checked style="width:auto; min-height:0;">保留管理员账号</label>
+        <button type="button" onclick="resetSystem()" style="background:#b42318;">重置系统</button>
+      </div>
     </div>
     </div>
 
@@ -1535,9 +1636,10 @@ function settingsForm(config: AppConfig): string {
     </label>
     <div class="wide" style="display:flex; flex-wrap:wrap; gap:10px;">
       <button type="button" onclick="generateAlipayKeyPair()">生成支付宝应用密钥对</button>
-      <button type="button" onclick="copyAlipayPublicKey()">复制应用公钥</button>
+      <button type="button" onclick="copyAlipayPublicKey()">复制支付宝后台专用公钥</button>
     </div>
-    <label class="wide">生成出的应用公钥，复制到支付宝开放平台<textarea id="alipay-app-public-key" readonly placeholder="点击“生成支付宝应用密钥对”后这里会出现应用公钥"></textarea></label>
+    <label class="wide">支付宝后台专用应用公钥，复制到支付宝开放平台<textarea id="alipay-app-public-key-text" readonly placeholder="点击“生成支付宝应用密钥对”后这里会出现一整行公钥字符串，不含头尾和换行"></textarea></label>
+    <label class="wide">应用公钥 PEM，仅备用查看<textarea id="alipay-app-public-key-pem" readonly placeholder="这里是 PEM 格式，通常不要粘到支付宝后台"></textarea></label>
     <label class="wide">支付宝应用私钥 PEM，查账必填<textarea name="alipay_private_key_pem" placeholder="${secretPlaceholder(config.alipayPrivateKeyPem)}"></textarea></label>
     <label class="wide">支付宝公钥 PEM，通知验签用<textarea name="alipay_public_key_pem" placeholder="${secretPlaceholder(config.alipayPublicKeyPem)}"></textarea></label>
     </div>
