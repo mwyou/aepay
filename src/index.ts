@@ -104,6 +104,7 @@ interface AppConfig {
   amountVarianceCents: string;
   collectAccount: string;
   collectQrImageUrl: string;
+  paymentPageTheme: string;
   alipayPollEnabled: string;
   alipayPollMethod: string;
   alipayPollWindowMinutes: string;
@@ -206,6 +207,7 @@ async function loadConfig(env: Env): Promise<AppConfig> {
     amountVarianceCents: settings.get("amount_variance_cents") || env.AMOUNT_VARIANCE_CENTS || "30",
     collectAccount: settings.get("collect_account") || env.COLLECT_ACCOUNT || "",
     collectQrImageUrl: settings.get("collect_qr_image_url") || env.COLLECT_QR_IMAGE_URL || "",
+    paymentPageTheme: settings.get("payment_page_theme") || "alipay",
     alipayPollEnabled: settings.get("alipay_poll_enabled") || "false",
     alipayPollMethod: settings.get("alipay_poll_method") || "alipay.data.bill.accountlog.query",
     alipayPollWindowMinutes: settings.get("alipay_poll_window_minutes") || "10",
@@ -236,6 +238,7 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
     amount_variance_cents: stringForm(form, "amount_variance_cents"),
     collect_account: stringForm(form, "collect_account"),
     collect_qr_image_url: collectQrImageUrl,
+    payment_page_theme: stringForm(form, "payment_page_theme") || "alipay",
     alipay_poll_enabled: stringForm(form, "alipay_poll_enabled") === "true" ? "true" : "false",
     alipay_poll_method: "alipay.data.bill.accountlog.query",
     alipay_poll_window_minutes: stringForm(form, "alipay_poll_window_minutes"),
@@ -250,6 +253,7 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
   if (plain.collect_qr_image_url && !plain.collect_qr_image_url.startsWith("data:image/")) {
     assertUrl(plain.collect_qr_image_url, "collect_qr_image_url");
   }
+  assertPaymentTheme(plain.payment_page_theme);
   assertPositiveInteger(plain.alipay_poll_window_minutes, "alipay_poll_window_minutes");
   if (plain.alipay_gateway_url) assertUrl(plain.alipay_gateway_url, "alipay_gateway_url");
   assertText(plain.epay_pid, "epay_pid");
@@ -542,10 +546,17 @@ async function runAlipayPolling(
     await finishPollingRun(env, runId, "success", rows.length, matchedCount, "");
     return { status: "success", fetched_count: rows.length, matched_count: matchedCount };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "polling failed";
+    const message = friendlyPollingError(error instanceof Error ? error.message : "polling failed");
     await finishPollingRun(env, runId, "failed", 0, 0, message);
     return { status: "failed", fetched_count: 0, matched_count: 0, error: message };
   }
+}
+
+function friendlyPollingError(message: string): string {
+  if (message.includes("isv.invalid-signature")) {
+    return "支付宝验签失败：应用私钥与支付宝开放平台配置的应用公钥不匹配";
+  }
+  return message.split("&amp;")[0].slice(0, 300);
 }
 
 async function createPollingRun(
@@ -1149,8 +1160,84 @@ function orderResponse(config: AppConfig, order: OrderRow, requestUrl: string): 
   };
 }
 
+function paymentTheme(name: string): {
+  colorScheme: string;
+  bg: string;
+  panel: string;
+  text: string;
+  muted: string;
+  line: string;
+  brand: string;
+  accent: string;
+  ok: string;
+  qrBg: string;
+  radius: string;
+  shadow: string;
+} {
+  const themes = {
+    minimal: {
+      colorScheme: "light",
+      bg: "#f6f8fb",
+      panel: "#ffffff",
+      text: "#1f2937",
+      muted: "#667085",
+      line: "#dfe5ee",
+      brand: "#102a43",
+      accent: "#2563eb",
+      ok: "#147d64",
+      qrBg: "#ffffff",
+      radius: "8px",
+      shadow: "0 12px 40px rgba(15,23,42,.08)",
+    },
+    alipay: {
+      colorScheme: "light",
+      bg: "#eaf4ff",
+      panel: "#ffffff",
+      text: "#132238",
+      muted: "#5b6b80",
+      line: "#cfe2f7",
+      brand: "#1677ff",
+      accent: "#1677ff",
+      ok: "#0f8f6b",
+      qrBg: "#f7fbff",
+      radius: "8px",
+      shadow: "0 18px 50px rgba(22,119,255,.18)",
+    },
+    dark: {
+      colorScheme: "dark",
+      bg: "#101418",
+      panel: "#171d23",
+      text: "#eef4f8",
+      muted: "#a9b4bf",
+      line: "#2b3640",
+      brand: "#22c55e",
+      accent: "#38bdf8",
+      ok: "#4ade80",
+      qrBg: "#ffffff",
+      radius: "8px",
+      shadow: "0 18px 60px rgba(0,0,0,.35)",
+    },
+    warm: {
+      colorScheme: "light",
+      bg: "#f8f1e8",
+      panel: "#fffdf9",
+      text: "#2b2118",
+      muted: "#7a6a5a",
+      line: "#eadfcc",
+      brand: "#b45309",
+      accent: "#c2410c",
+      ok: "#15803d",
+      qrBg: "#fffaf2",
+      radius: "8px",
+      shadow: "0 18px 46px rgba(120,80,30,.14)",
+    },
+  };
+  return themes[name as keyof typeof themes] || themes.alipay;
+}
+
 function renderPaymentPage(config: AppConfig, order: OrderRow): string {
   const done = order.status === "paid";
+  const theme = paymentTheme(config.paymentPageTheme);
   const qr = config.collectQrImageUrl
     ? `<img class="qr" src="${escapeHtml(config.collectQrImageUrl)}" alt="支付宝收款码">`
     : `<div class="empty">未配置收款码图片，请向商户索取支付宝收款码。</div>`;
@@ -1161,26 +1248,33 @@ function renderPaymentPage(config: AppConfig, order: OrderRow): string {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>支付订单 ${escapeHtml(order.merchant_order_no)}</title>
   <style>
-    body { margin:0; min-height:100vh; display:grid; place-items:center; background:#f6f8fb; color:#1f2937; font:15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    main { width:min(430px, calc(100vw - 32px)); background:#fff; border:1px solid #dfe5ee; border-radius:8px; padding:22px; text-align:center; box-shadow:0 12px 40px rgba(15,23,42,.08); }
+    :root { color-scheme:${theme.colorScheme}; --bg:${theme.bg}; --panel:${theme.panel}; --text:${theme.text}; --muted:${theme.muted}; --line:${theme.line}; --brand:${theme.brand}; --accent:${theme.accent}; --ok:${theme.ok}; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; display:grid; place-items:center; padding:20px; background:var(--bg); color:var(--text); font:15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width:min(430px, 100%); background:var(--panel); border:1px solid var(--line); border-radius:${theme.radius}; padding:22px; text-align:center; box-shadow:${theme.shadow}; }
+    .brand { width:44px; height:44px; margin:0 auto 12px; display:grid; place-items:center; border-radius:12px; color:white; background:var(--brand); font-size:22px; font-weight:850; }
     h1 { margin:0 0 10px; font-size:20px; }
-    .amount { margin:8px 0 16px; font-size:38px; font-weight:750; color:#2563eb; }
-    .qr { width:min(280px, 72vw); aspect-ratio:1; object-fit:contain; border:1px solid #e5e7eb; border-radius:8px; }
-    .empty { border:1px dashed #cbd5e1; border-radius:8px; padding:34px 18px; color:#667085; }
-    .meta { margin-top:16px; color:#667085; font-size:13px; text-align:left; display:grid; gap:6px; }
-    .paid { color:#147d64; font-weight:700; }
+    .amount { margin:8px 0 16px; font-size:42px; font-weight:800; color:var(--accent); }
+    .qr-wrap { margin:0 auto; padding:12px; border:1px solid var(--line); border-radius:${theme.radius}; background:${theme.qrBg}; }
+    .qr { width:min(280px, 68vw); aspect-ratio:1; object-fit:contain; display:block; margin:auto; border-radius:6px; }
+    .empty { border:1px dashed var(--line); border-radius:${theme.radius}; padding:34px 18px; color:var(--muted); }
+    .meta { margin-top:16px; color:var(--muted); font-size:13px; text-align:left; display:grid; gap:6px; }
+    .meta div { display:flex; justify-content:space-between; gap:12px; border-bottom:1px solid var(--line); padding-bottom:6px; }
+    .meta div:last-child { border-bottom:0; padding-bottom:0; }
+    .paid { color:var(--ok); font-weight:750; }
   </style>
 </head>
 <body>
   <main>
+    <div class="brand">支</div>
     <h1>${escapeHtml(done ? "支付已确认" : "支付宝扫码付款")}</h1>
     <div class="amount">¥${escapeHtml(order.pay_amount)}</div>
-    ${done ? `<p class="paid">订单已到账，无需重复支付。</p>` : qr}
+    ${done ? `<p class="paid">订单已到账，无需重复支付。</p>` : `<div class="qr-wrap">${qr}</div>`}
     <div class="meta">
-      <div>订单号：${escapeHtml(order.merchant_order_no)}</div>
-      <div>商品：${escapeHtml(order.subject || "-")}</div>
-      <div>状态：${escapeHtml(order.status)}</div>
-      <div>过期时间：${escapeHtml(order.expires_at)}</div>
+      <div><span>订单号</span><strong>${escapeHtml(order.merchant_order_no)}</strong></div>
+      <div><span>商品</span><strong>${escapeHtml(order.subject || "-")}</strong></div>
+      <div><span>状态</span><strong>${escapeHtml(order.status)}</strong></div>
+      <div><span>过期时间</span><strong>${escapeHtml(shortDate(order.expires_at, config.timeZone))}</strong></div>
     </div>
   </main>
 </body>
@@ -1328,6 +1422,47 @@ function renderAdmin(
       const input = document.querySelector('[name="' + name + '"]');
       if (input) input.value = value;
     }
+    async function copyText(value) {
+      if (!value) {
+        alert('还没有可复制的值');
+        return;
+      }
+      await navigator.clipboard.writeText(value);
+      alert('已复制');
+    }
+    function pemFromBase64(base64, type) {
+      const lines = base64.match(/.{1,64}/g) || [];
+      return '-----BEGIN ' + type + '-----\\n' + lines.join('\\n') + '\\n-----END ' + type + '-----';
+    }
+    async function generateAlipayKeyPair() {
+      const pair = await crypto.subtle.generateKey(
+        {
+          name: 'RSASSA-PKCS1-v1_5',
+          modulusLength: 2048,
+          publicExponent: new Uint8Array([1, 0, 1]),
+          hash: 'SHA-256'
+        },
+        true,
+        ['sign', 'verify']
+      );
+      const privateKey = await crypto.subtle.exportKey('pkcs8', pair.privateKey);
+      const publicKey = await crypto.subtle.exportKey('spki', pair.publicKey);
+      const privatePem = pemFromBase64(btoa(String.fromCharCode(...new Uint8Array(privateKey))), 'PRIVATE KEY');
+      const publicPem = pemFromBase64(btoa(String.fromCharCode(...new Uint8Array(publicKey))), 'PUBLIC KEY');
+      const privateInput = document.querySelector('[name="alipay_private_key_pem"]');
+      const publicOutput = document.querySelector('#alipay-app-public-key');
+      if (privateInput) privateInput.value = privatePem;
+      if (publicOutput) publicOutput.value = publicPem;
+    }
+    async function copyAlipayPublicKey() {
+      const output = document.querySelector('#alipay-app-public-key');
+      if (!output || !output.value) {
+        alert('请先生成支付宝应用密钥对');
+        return;
+      }
+      await navigator.clipboard.writeText(output.value);
+      alert('已复制应用公钥，请粘贴到支付宝开放平台的“应用公钥”配置里');
+    }
   </script>
 </body>
 </html>`;
@@ -1350,19 +1485,22 @@ function settingsForm(config: AppConfig): string {
     <label>订单过期分钟<input name="order_expire_minutes" value="${escapeAttr(config.orderExpireMinutes)}" inputmode="numeric" required></label>
     <label>金额尾数范围<input name="amount_variance_cents" value="${escapeAttr(config.amountVarianceCents)}" inputmode="numeric" required></label>
     <label>回调 HMAC 密钥，仅 JSON 回调用<input name="callback_secret" type="password" placeholder="${secretPlaceholder(config.callbackSecret)}"></label>
+    <label>商户 API Key，仅直连 API 用<input name="merchant_api_key" type="password" placeholder="${secretPlaceholder(config.merchantApiKey)}"></label>
     <label>管理员账号<input name="admin_username" value="${escapeAttr(config.adminUsername)}" autocomplete="username"></label>
     <label>管理员新密码<input name="admin_password" type="password" placeholder="${secretPlaceholder(config.adminPasswordHash)}" autocomplete="new-password"></label>
+    <div class="wide" style="display:flex; flex-wrap:wrap; gap:10px;">
+      <button type="button" onclick="fillSecret('callback_secret')">生成回调 HMAC 密钥</button>
+      <button type="button" onclick="fillSecret('merchant_api_key')">生成商户 API Key</button>
+    </div>
     </div>
 
     <div class="panel" data-panel="epay" hidden style="display:contents;">
     <div class="note wide" style="padding:0;">易支付页放给上游商城/发卡系统配置的参数。</div>
     <label>易支付 PID，必填<input name="epay_pid" value="${escapeAttr(config.epayPid)}" required></label>
     <label>易支付 Key，必填<input name="epay_key" type="password" placeholder="${secretPlaceholder(config.epayKey)}"></label>
-    <label>商户 API Key，仅直连 API 用<input name="merchant_api_key" type="password" placeholder="${secretPlaceholder(config.merchantApiKey)}"></label>
+    <div class="note wide" style="padding:0;">当前易支付 Key：${secretPreview(config.epayKey)} ${config.epayKey ? `<button type="button" onclick="copyText('${escapeJs(config.epayKey)}')">复制易支付 Key</button>` : ""}</div>
     <div class="wide" style="display:flex; flex-wrap:wrap; gap:10px;">
       <button type="button" onclick="fillSecret('epay_key')">生成易支付 Key</button>
-      <button type="button" onclick="fillSecret('merchant_api_key')">生成商户 API Key</button>
-      <button type="button" onclick="fillSecret('callback_secret')">生成回调 HMAC 密钥</button>
     </div>
     </div>
 
@@ -1370,6 +1508,14 @@ function settingsForm(config: AppConfig): string {
     <div class="note wide" style="padding:0;">支付宝页放经营码展示和开放平台查账配置。查账接口已内置为支付宝商家账户账务明细查询。</div>
     <label>收款码图片，必填<input name="collect_qr_image_file" type="file" accept="image/png,image/jpeg,image/webp"></label>
     <label>收款码图片 URL，已有图床才填<input name="collect_qr_image_url" value="${config.collectQrImageUrl.startsWith("data:image/") ? "" : escapeAttr(config.collectQrImageUrl)}" placeholder="${config.collectQrImageUrl ? "已配置，上传新图片或填新 URL 可替换" : "https://.../alipay-qr.png"}"></label>
+    <label>支付页主题
+      <select name="payment_page_theme">
+        ${paymentThemeOption(config.paymentPageTheme, "alipay", "支付宝蓝")}
+        ${paymentThemeOption(config.paymentPageTheme, "minimal", "简洁白")}
+        ${paymentThemeOption(config.paymentPageTheme, "dark", "暗色")}
+        ${paymentThemeOption(config.paymentPageTheme, "warm", "暖色")}
+      </select>
+    </label>
     <label>收款账号标识，可空<input name="collect_account" value="${escapeAttr(config.collectAccount)}" placeholder="用于多收款账号时过滤匹配"></label>
     <label>支付宝 APP_ID，必填<input name="alipay_app_id" type="password" placeholder="${secretPlaceholder(config.alipayAppId)}"></label>
     <label>自动查账
@@ -1387,12 +1533,17 @@ function settingsForm(config: AppConfig): string {
         <option value="false"${config.alipayNotifyVerifyRequired === "false" ? " selected" : ""}>关闭</option>
       </select>
     </label>
+    <div class="wide" style="display:flex; flex-wrap:wrap; gap:10px;">
+      <button type="button" onclick="generateAlipayKeyPair()">生成支付宝应用密钥对</button>
+      <button type="button" onclick="copyAlipayPublicKey()">复制应用公钥</button>
+    </div>
+    <label class="wide">生成出的应用公钥，复制到支付宝开放平台<textarea id="alipay-app-public-key" readonly placeholder="点击“生成支付宝应用密钥对”后这里会出现应用公钥"></textarea></label>
     <label class="wide">支付宝应用私钥 PEM，查账必填<textarea name="alipay_private_key_pem" placeholder="${secretPlaceholder(config.alipayPrivateKeyPem)}"></textarea></label>
     <label class="wide">支付宝公钥 PEM，通知验签用<textarea name="alipay_public_key_pem" placeholder="${secretPlaceholder(config.alipayPublicKeyPem)}"></textarea></label>
     </div>
 
     <button type="submit">保存设置</button>
-    <div class="note wide">密钥类字段留空表示不修改；页面不会回显明文。易支付接入必须配置易支付 Key；商户 API Key 和回调 HMAC 密钥只在对应接入方式下使用。</div>
+    <div class="note wide">密钥类字段留空表示不修改；易支付接入只需要配置易支付 PID 和易支付 Key。商户 API Key 只给直接调用 /api/orders 的程序用。</div>
   </form>`;
 }
 
@@ -1465,7 +1616,21 @@ function secretPlaceholder(value: string): string {
   return value ? "已配置，留空不修改" : "未配置";
 }
 
+function secretPreview(value: string): string {
+  if (!value) return "未配置";
+  if (value.length <= 10) return escapeHtml(value);
+  return `${escapeHtml(value.slice(0, 4))}...${escapeHtml(value.slice(-4))}`;
+}
+
+function escapeJs(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
+}
+
 function timeZoneOption(current: string, value: string, label: string): string {
+  return `<option value="${escapeAttr(value)}"${current === value ? " selected" : ""}>${escapeHtml(label)}</option>`;
+}
+
+function paymentThemeOption(current: string, value: string, label: string): string {
   return `<option value="${escapeAttr(value)}"${current === value ? " selected" : ""}>${escapeHtml(label)}</option>`;
 }
 
@@ -1800,6 +1965,12 @@ function assertTimeZone(value: string): void {
     new Intl.DateTimeFormat("zh-CN", { timeZone: value }).format(new Date());
   } catch {
     throw new Error("time_zone must be a valid IANA timezone");
+  }
+}
+
+function assertPaymentTheme(value: string): void {
+  if (!["alipay", "minimal", "dark", "warm"].includes(value)) {
+    throw new Error("payment_page_theme is invalid");
   }
 }
 

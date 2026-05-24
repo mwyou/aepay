@@ -100,6 +100,7 @@ INSERT OR IGNORE INTO system_settings (key, value, is_secret, updated_at) VALUES
   ('amount_variance_cents', '30', 0, datetime('now')),
   ('collect_account', '', 0, datetime('now')),
   ('collect_qr_image_url', '', 0, datetime('now')),
+  ('payment_page_theme', 'alipay', 0, datetime('now')),
   ('alipay_poll_enabled', 'false', 0, datetime('now')),
   ('alipay_poll_method', 'alipay.data.bill.accountlog.query', 0, datetime('now')),
   ('alipay_poll_window_minutes', '10', 0, datetime('now')),
