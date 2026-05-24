@@ -201,7 +201,7 @@ async function loadConfig(env: Env): Promise<AppConfig> {
     collectAccount: settings.get("collect_account") || env.COLLECT_ACCOUNT || "",
     collectQrImageUrl: settings.get("collect_qr_image_url") || env.COLLECT_QR_IMAGE_URL || "",
     alipayPollEnabled: settings.get("alipay_poll_enabled") || "false",
-    alipayPollMethod: settings.get("alipay_poll_method") || "",
+    alipayPollMethod: settings.get("alipay_poll_method") || "alipay.data.bill.accountlog.query",
     alipayPollWindowMinutes: settings.get("alipay_poll_window_minutes") || "10",
     alipayGatewayUrl: settings.get("alipay_gateway_url") || "https://openapi.alipay.com/gateway.do",
     alipayAppId: settings.get("alipay_app_id") || env.ALIPAY_APP_ID || "",
@@ -221,14 +221,16 @@ async function loadConfig(env: Env): Promise<AppConfig> {
 async function updateSettings(request: Request, env: Env, config: AppConfig): Promise<Response> {
   const form = await request.formData();
   const now = new Date().toISOString();
+  const uploadedQrImage = await uploadedImageDataUrl(form, "collect_qr_image_file");
+  const collectQrImageUrl = uploadedQrImage || stringForm(form, "collect_qr_image_url") || config.collectQrImageUrl;
   const plain: Record<string, string> = {
     app_name: stringForm(form, "app_name"),
     order_expire_minutes: stringForm(form, "order_expire_minutes"),
     amount_variance_cents: stringForm(form, "amount_variance_cents"),
     collect_account: stringForm(form, "collect_account"),
-    collect_qr_image_url: stringForm(form, "collect_qr_image_url"),
+    collect_qr_image_url: collectQrImageUrl,
     alipay_poll_enabled: stringForm(form, "alipay_poll_enabled") === "true" ? "true" : "false",
-    alipay_poll_method: stringForm(form, "alipay_poll_method"),
+    alipay_poll_method: "alipay.data.bill.accountlog.query",
     alipay_poll_window_minutes: stringForm(form, "alipay_poll_window_minutes"),
     alipay_gateway_url: stringForm(form, "alipay_gateway_url"),
     alipay_notify_verify_required: stringForm(form, "alipay_notify_verify_required") === "true" ? "true" : "false",
@@ -237,7 +239,9 @@ async function updateSettings(request: Request, env: Env, config: AppConfig): Pr
   assertText(plain.app_name, "app_name");
   assertPositiveInteger(plain.order_expire_minutes, "order_expire_minutes");
   assertPositiveInteger(plain.amount_variance_cents, "amount_variance_cents");
-  if (plain.collect_qr_image_url) assertUrl(plain.collect_qr_image_url, "collect_qr_image_url");
+  if (plain.collect_qr_image_url && !plain.collect_qr_image_url.startsWith("data:image/")) {
+    assertUrl(plain.collect_qr_image_url, "collect_qr_image_url");
+  }
   assertPositiveInteger(plain.alipay_poll_window_minutes, "alipay_poll_window_minutes");
   if (plain.alipay_gateway_url) assertUrl(plain.alipay_gateway_url, "alipay_gateway_url");
   assertText(plain.epay_pid, "epay_pid");
@@ -283,6 +287,18 @@ async function upsertSetting(env: Env, key: string, value: string, isSecret: boo
 function stringForm(form: FormData, key: string): string {
   const value = form.get(key);
   return typeof value === "string" ? value.trim() : "";
+}
+
+async function uploadedImageDataUrl(form: FormData, key: string): Promise<string> {
+  const value = form.get(key);
+  if (!(value instanceof File) || value.size === 0) return "";
+  if (!["image/png", "image/jpeg", "image/webp"].includes(value.type)) {
+    throw new HttpError(400, "收款码图片只支持 PNG、JPG 或 WebP");
+  }
+  if (value.size > 750_000) {
+    throw new HttpError(400, "收款码图片不能超过 750KB");
+  }
+  return `data:${value.type};base64,${arrayBufferToBase64(await value.arrayBuffer())}`;
 }
 
 async function createOrder(request: Request, env: Env, config: AppConfig): Promise<Response> {
@@ -493,11 +509,11 @@ async function runAlipayPolling(
 
   try {
     if (config.alipayPollEnabled !== "true" && !force) {
-      await finishPollingRun(env, runId, "skipped", 0, 0, "polling disabled");
-      return { status: "skipped", fetched_count: 0, matched_count: 0, error: "polling disabled" };
+      await finishPollingRun(env, runId, "skipped", 0, 0, "自动查账未开启");
+      return { status: "skipped", fetched_count: 0, matched_count: 0, error: "自动查账未开启" };
     }
-    if (!config.alipayAppId || !config.alipayPrivateKeyPem || !config.alipayPollMethod) {
-      throw new Error("支付宝查账未配置完整：APP_ID、应用私钥和查账接口名都必填");
+    if (!config.alipayAppId || !config.alipayPrivateKeyPem) {
+      throw new Error("支付宝查账未配置完整：APP_ID 和应用私钥都必填");
     }
 
     const rows = await queryAlipayTransactions(config, windowStart, windowEnd);
@@ -565,14 +581,12 @@ async function queryAlipayTransactions(config: AppConfig, start: Date, end: Date
 }
 
 function defaultAlipayPollPayload(method: string, start: Date, end: Date): Record<string, unknown> {
-  if (method === "alipay.user.accountreport.get") {
+  if (method === "alipay.data.bill.accountlog.query") {
     return {
-      fields:
-        "create_time,type,business_type,balance,in_amount,out_amount,alipay_order_no,merchant_order_no,self_user_id,opt_user_id,memo",
       start_time: formatAlipayTime(start),
       end_time: formatAlipayTime(end),
       page_no: 1,
-      page_size: 100,
+      page_size: 1000,
     };
   }
   return {
@@ -635,16 +649,25 @@ function alipayResponseError(value: unknown): string {
 function extractPolledTransactions(response: unknown): PolledTransaction[] {
   const rows = findTransactionRows(response);
   return rows.flatMap((row) => {
-    const tradeNo = stringField(row, ["alipay_order_no", "trade_no", "provider_trade_no", "transaction_id", "order_no"]);
-    const amount = stringField(row, ["in_amount", "amount", "total_amount", "pay_amount"]);
-    const paidAt = stringField(row, ["create_time", "paid_at", "pay_time", "gmt_payment"]);
+    const direction = stringField(row, ["direction"]);
+    if (direction && !["收入", "in", "IN", "income", "CREDIT"].includes(direction)) return [];
+    const tradeNo = stringField(row, [
+      "account_log_id",
+      "alipay_order_no",
+      "trade_no",
+      "provider_trade_no",
+      "transaction_id",
+      "order_no",
+    ]);
+    const amount = stringField(row, ["trans_amount", "in_amount", "amount", "total_amount", "pay_amount"]);
+    const paidAt = stringField(row, ["trans_dt", "create_time", "paid_at", "pay_time", "gmt_payment"]);
     if (!tradeNo || !/^\d+(\.\d{1,2})?$/.test(amount) || moneyToCents(amount) <= 0 || !paidAt) return [];
     return [
       {
         provider_trade_no: tradeNo,
         amount: centsToMoney(moneyToCents(amount)),
         paid_at: normalizeDate(paidAt.includes("T") ? paidAt : paidAt.replace(" ", "T") + "+08:00", "paid_at"),
-        payer: stringField(row, ["opt_user_id", "buyer_user_id", "buyer_logon_id", "payer"]),
+        payer: stringField(row, ["other_account", "opt_user_id", "buyer_user_id", "buyer_logon_id", "payer"]),
         collect_account: stringField(row, ["self_user_id", "seller_id", "collect_account"]),
         raw_payload: row,
       },
@@ -1181,6 +1204,10 @@ function renderAdmin(
     .failed { background:#fee4e2; color:var(--bad); }
     form { padding:16px; display:grid; grid-template-columns:repeat(5,minmax(130px,1fr)); gap:10px; align-items:end; }
     .settings-form { grid-template-columns:repeat(3,minmax(180px,1fr)); align-items:start; }
+    .tabs { display:flex; flex-wrap:wrap; gap:8px; }
+    .tab { height:34px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--text); padding:0 12px; font-weight:650; cursor:pointer; }
+    .tab.active { background:var(--brand); border-color:var(--brand); color:#fff; }
+    .panel[hidden] { display:none !important; }
     label { display:grid; gap:5px; color:var(--muted); font-size:12px; }
     input, select, textarea { width:100%; min-height:38px; border:1px solid var(--line); border-radius:6px; padding:0 10px; font:inherit; color:var(--text); background:#fff; }
     textarea { min-height:96px; padding:10px; resize:vertical; }
@@ -1197,11 +1224,18 @@ function renderAdmin(
     <form method="post" action="/admin/logout" style="padding:0; display:flex; justify-content:flex-end;">
       <button type="submit" style="width:auto;">退出登录</button>
     </form>
-    <section>
-      <h2>系统设置</h2>
+    <nav class="tabs" aria-label="后台导航">
+      <button class="tab active" type="button" data-tab="overview">概览</button>
+      <button class="tab" type="button" data-tab="system">系统</button>
+      <button class="tab" type="button" data-tab="epay">易支付</button>
+      <button class="tab" type="button" data-tab="alipay">支付宝</button>
+      <button class="tab" type="button" data-tab="debug">调试</button>
+    </nav>
+    <section id="settings-section" hidden>
+      <h2>设置</h2>
       ${settingsForm(config)}
     </section>
-    <section>
+    <section class="panel" data-panel="debug" hidden>
       <h2>调试核销</h2>
       <form method="post" action="/api/reconcile/manual" onsubmit="return submitReconcile(event)">
         <label>支付宝交易号<input name="alipay_trade_no" required></label>
@@ -1212,29 +1246,40 @@ function renderAdmin(
       </form>
       <div class="note">仅用于开发测试自动匹配和回调链路；正式流程由自动查账完成。</div>
     </section>
-    <section>
+    <section class="panel" data-panel="alipay" hidden>
       <h2>自动查账</h2>
       <form method="post" action="/api/admin/polling/run" onsubmit="return submitPolling(event)" style="grid-template-columns:1fr auto;">
-        <div class="note" style="padding:0;">Cron 每分钟执行一次；保存支付宝查账配置后，可在这里立即测试一次。</div>
+        <div class="note" style="padding:0;">开启自动查账并保存支付宝配置后，Cron 每分钟执行一次；这里也可以手动立即测试。</div>
         <button type="submit">立即查账</button>
       </form>
       <div class="scroll">${pollingRunsTable(pollingRuns)}</div>
     </section>
-    <section>
+    <section class="panel" data-panel="overview">
       <h2>订单</h2>
       <div class="scroll">${ordersTable(orders)}</div>
     </section>
-    <section>
+    <section class="panel" data-panel="overview">
       <h2>到账事件</h2>
       <div class="scroll">${eventsTable(events)}</div>
     </section>
-    <section>
+    <section class="panel" data-panel="overview">
       <h2>回调日志</h2>
       <div class="scroll">${callbacksTable(callbacks)}</div>
     </section>
   </main>
   <script>
     document.querySelector('input[name="paid_at"]').value = new Date().toISOString();
+    document.querySelectorAll('[data-tab]').forEach(button => {
+      button.addEventListener('click', () => {
+        const target = button.dataset.tab;
+        document.querySelectorAll('[data-tab]').forEach(item => item.classList.toggle('active', item === button));
+        const settings = document.querySelector('#settings-section');
+        if (settings) settings.hidden = !['system', 'epay', 'alipay'].includes(target);
+        document.querySelectorAll('[data-panel]').forEach(panel => {
+          panel.hidden = panel.dataset.panel !== target;
+        });
+      });
+    });
     async function submitReconcile(event) {
       event.preventDefault();
       const form = event.currentTarget;
@@ -1255,44 +1300,70 @@ function renderAdmin(
       if (res.ok) location.reload();
       return false;
     }
+    function fillSecret(name) {
+      const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+      const bytes = new Uint8Array(40);
+      crypto.getRandomValues(bytes);
+      const value = Array.from(bytes, byte => alphabet[byte % alphabet.length]).join('');
+      const input = document.querySelector('[name="' + name + '"]');
+      if (input) input.value = value;
+    }
   </script>
 </body>
 </html>`;
 }
 
 function settingsForm(config: AppConfig): string {
-  return `<form class="settings-form" method="post" action="/api/admin/settings">
+  return `<form class="settings-form" method="post" action="/api/admin/settings" enctype="multipart/form-data">
+    <div class="panel" data-panel="system" hidden style="display:contents;">
+    <div class="note wide" style="padding:0;">系统页只放本系统自己的行为设置和管理员账号。</div>
     <label>系统名称<input name="app_name" value="${escapeAttr(config.appName)}" required></label>
     <label>订单过期分钟<input name="order_expire_minutes" value="${escapeAttr(config.orderExpireMinutes)}" inputmode="numeric" required></label>
     <label>金额尾数范围<input name="amount_variance_cents" value="${escapeAttr(config.amountVarianceCents)}" inputmode="numeric" required></label>
-    <label>收款账号标识<input name="collect_account" value="${escapeAttr(config.collectAccount)}"></label>
-    <label>收款码图片 URL<input name="collect_qr_image_url" value="${escapeAttr(config.collectQrImageUrl)}"></label>
-    <label>易支付 PID<input name="epay_pid" value="${escapeAttr(config.epayPid)}" required></label>
+    <label>回调 HMAC 密钥，仅 JSON 回调用<input name="callback_secret" type="password" placeholder="${secretPlaceholder(config.callbackSecret)}"></label>
+    <label>管理员账号<input name="admin_username" value="${escapeAttr(config.adminUsername)}" autocomplete="username"></label>
+    <label>管理员新密码<input name="admin_password" type="password" placeholder="${secretPlaceholder(config.adminPasswordHash)}" autocomplete="new-password"></label>
+    </div>
+
+    <div class="panel" data-panel="epay" hidden style="display:contents;">
+    <div class="note wide" style="padding:0;">易支付页放给上游商城/发卡系统配置的参数。</div>
+    <label>易支付 PID，必填<input name="epay_pid" value="${escapeAttr(config.epayPid)}" required></label>
+    <label>易支付 Key，必填<input name="epay_key" type="password" placeholder="${secretPlaceholder(config.epayKey)}"></label>
+    <label>商户 API Key，仅直连 API 用<input name="merchant_api_key" type="password" placeholder="${secretPlaceholder(config.merchantApiKey)}"></label>
+    <div class="wide" style="display:flex; flex-wrap:wrap; gap:10px;">
+      <button type="button" onclick="fillSecret('epay_key')">生成易支付 Key</button>
+      <button type="button" onclick="fillSecret('merchant_api_key')">生成商户 API Key</button>
+      <button type="button" onclick="fillSecret('callback_secret')">生成回调 HMAC 密钥</button>
+    </div>
+    </div>
+
+    <div class="panel" data-panel="alipay" hidden style="display:contents;">
+    <div class="note wide" style="padding:0;">支付宝页放经营码展示和开放平台查账配置。查账接口已内置为支付宝商家账户账务明细查询。</div>
+    <label>收款码图片，必填<input name="collect_qr_image_file" type="file" accept="image/png,image/jpeg,image/webp"></label>
+    <label>收款码图片 URL，已有图床才填<input name="collect_qr_image_url" value="${config.collectQrImageUrl.startsWith("data:image/") ? "" : escapeAttr(config.collectQrImageUrl)}" placeholder="${config.collectQrImageUrl ? "已配置，上传新图片或填新 URL 可替换" : "https://.../alipay-qr.png"}"></label>
+    <label>收款账号标识，可空<input name="collect_account" value="${escapeAttr(config.collectAccount)}" placeholder="用于多收款账号时过滤匹配"></label>
+    <label>支付宝 APP_ID，必填<input name="alipay_app_id" type="password" placeholder="${secretPlaceholder(config.alipayAppId)}"></label>
     <label>自动查账
       <select name="alipay_poll_enabled">
         <option value="false"${config.alipayPollEnabled !== "true" ? " selected" : ""}>关闭</option>
         <option value="true"${config.alipayPollEnabled === "true" ? " selected" : ""}>开启</option>
       </select>
     </label>
-    <label>查账接口名<input name="alipay_poll_method" value="${escapeAttr(config.alipayPollMethod)}" placeholder="alipay.user.accountreport.get"></label>
+    <label>查账接口<input value="支付宝商家账户账务明细查询" disabled></label>
     <label>查账回看分钟<input name="alipay_poll_window_minutes" value="${escapeAttr(config.alipayPollWindowMinutes)}" inputmode="numeric" required></label>
-    <label class="wide">支付宝网关<input name="alipay_gateway_url" value="${escapeAttr(config.alipayGatewayUrl)}" required></label>
+    <label class="wide">支付宝网关，默认即可<input name="alipay_gateway_url" value="${escapeAttr(config.alipayGatewayUrl)}" required></label>
     <label>支付宝通知验签
       <select name="alipay_notify_verify_required">
         <option value="true"${config.alipayNotifyVerifyRequired === "true" ? " selected" : ""}>开启</option>
         <option value="false"${config.alipayNotifyVerifyRequired === "false" ? " selected" : ""}>关闭</option>
       </select>
     </label>
-    <label>商户 API Key<input name="merchant_api_key" type="password" placeholder="${secretPlaceholder(config.merchantApiKey)}"></label>
-    <label>易支付 Key<input name="epay_key" type="password" placeholder="${secretPlaceholder(config.epayKey)}"></label>
-    <label>回调 HMAC 密钥<input name="callback_secret" type="password" placeholder="${secretPlaceholder(config.callbackSecret)}"></label>
-    <label>支付宝 APP_ID<input name="alipay_app_id" type="password" placeholder="${secretPlaceholder(config.alipayAppId)}"></label>
-    <label>管理员账号<input name="admin_username" value="${escapeAttr(config.adminUsername)}" autocomplete="username"></label>
-    <label>管理员新密码<input name="admin_password" type="password" placeholder="${secretPlaceholder(config.adminPasswordHash)}" autocomplete="new-password"></label>
-    <label class="wide">支付宝应用私钥 PEM<textarea name="alipay_private_key_pem" placeholder="${secretPlaceholder(config.alipayPrivateKeyPem)}"></textarea></label>
-    <label class="wide">支付宝公钥 PEM<textarea name="alipay_public_key_pem" placeholder="${secretPlaceholder(config.alipayPublicKeyPem)}"></textarea></label>
+    <label class="wide">支付宝应用私钥 PEM，查账必填<textarea name="alipay_private_key_pem" placeholder="${secretPlaceholder(config.alipayPrivateKeyPem)}"></textarea></label>
+    <label class="wide">支付宝公钥 PEM，通知验签用<textarea name="alipay_public_key_pem" placeholder="${secretPlaceholder(config.alipayPublicKeyPem)}"></textarea></label>
+    </div>
+
     <button type="submit">保存设置</button>
-    <div class="note wide">密钥类字段留空表示不修改；页面不会回显明文。</div>
+    <div class="note wide">密钥类字段留空表示不修改；页面不会回显明文。易支付接入必须配置易支付 Key；商户 API Key 和回调 HMAC 密钥只在对应接入方式下使用。</div>
   </form>`;
 }
 

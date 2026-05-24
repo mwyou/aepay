@@ -100,7 +100,7 @@ INSERT OR IGNORE INTO system_settings (key, value, is_secret, updated_at) VALUES
   ('collect_account', '', 0, datetime('now')),
   ('collect_qr_image_url', '', 0, datetime('now')),
   ('alipay_poll_enabled', 'false', 0, datetime('now')),
-  ('alipay_poll_method', '', 0, datetime('now')),
+  ('alipay_poll_method', 'alipay.data.bill.accountlog.query', 0, datetime('now')),
   ('alipay_poll_window_minutes', '10', 0, datetime('now')),
   ('alipay_gateway_url', 'https://openapi.alipay.com/gateway.do', 0, datetime('now')),
   ('alipay_app_id', '', 1, datetime('now')),
