@@ -1470,6 +1470,7 @@ function renderAdmin(
       <button class="tab active" type="button" data-tab="overview">概览</button>
       <button class="tab" type="button" data-tab="system">系统</button>
       <button class="tab" type="button" data-tab="epay">易支付</button>
+      <button class="tab" type="button" data-tab="payment">支付页</button>
       <button class="tab" type="button" data-tab="alipay">支付宝</button>
       <button class="tab" type="button" data-tab="test">支付测试</button>
     </nav>
@@ -1513,7 +1514,7 @@ function renderAdmin(
         const target = button.dataset.tab;
         document.querySelectorAll('[data-tab]').forEach(item => item.classList.toggle('active', item === button));
         const settings = document.querySelector('#settings-section');
-        if (settings) settings.hidden = !['system', 'epay', 'alipay'].includes(target);
+        if (settings) settings.hidden = !['system', 'epay', 'payment', 'alipay'].includes(target);
         document.querySelectorAll('[data-panel]').forEach(panel => {
           panel.hidden = panel.dataset.panel !== target;
         });
@@ -1674,8 +1675,8 @@ function settingsForm(config: AppConfig): string {
     </div>
     </div>
 
-    <div class="panel" data-panel="alipay" hidden style="display:contents;">
-    <div class="note wide" style="padding:0;">支付宝页放经营码展示和开放平台查账配置。查账接口已内置为支付宝商家账户账务明细查询。</div>
+    <div class="panel" data-panel="payment" hidden style="display:contents;">
+    <div class="note wide" style="padding:0;">支付页设置只影响用户扫码付款页面，不影响支付宝开放平台查账。</div>
     <label>收款码图片，必填<input name="collect_qr_image_file" type="file" accept="image/png,image/jpeg,image/webp"></label>
     <label>收款码图片 URL，已有图床才填<input name="collect_qr_image_url" value="${config.collectQrImageUrl.startsWith("data:image/") ? "" : escapeAttr(config.collectQrImageUrl)}" placeholder="${config.collectQrImageUrl ? "已配置，上传新图片或填新 URL 可替换" : "https://.../alipay-qr.png"}"></label>
     <label>支付页主题
@@ -1686,6 +1687,10 @@ function settingsForm(config: AppConfig): string {
         ${paymentThemeOption(config.paymentPageTheme, "warm", "暖色")}
       </select>
     </label>
+    </div>
+
+    <div class="panel" data-panel="alipay" hidden style="display:contents;">
+    <div class="note wide" style="padding:0;">支付宝页只放开放平台查账和验签配置。查账接口已内置为支付宝商家账户账务明细查询。</div>
     <label>收款账号标识，可空<input name="collect_account" value="${escapeAttr(config.collectAccount)}" placeholder="用于多收款账号时过滤匹配"></label>
     <label>支付宝 APP_ID，必填<input name="alipay_app_id" type="password" placeholder="${secretPlaceholder(config.alipayAppId)}"></label>
     <input name="alipay_app_public_key_text" type="hidden" value="${escapeAttr(config.alipayAppPublicKeyText)}">
@@ -1698,6 +1703,7 @@ function settingsForm(config: AppConfig): string {
     <label>查账接口<input value="支付宝商家账户账务明细查询" disabled></label>
     <label>查账回看分钟<input name="alipay_poll_window_minutes" value="${escapeAttr(config.alipayPollWindowMinutes)}" inputmode="numeric" required></label>
     <label class="wide">支付宝网关，默认即可<input name="alipay_gateway_url" value="${escapeAttr(config.alipayGatewayUrl)}" required></label>
+    <div class="note wide" style="padding:0; font-weight:700; color:#1f2937;">AEPay 应用密钥：私钥保存在本系统，公钥复制到支付宝开放平台。</div>
     <label>支付宝通知验签
       <select name="alipay_notify_verify_required">
         <option value="true"${config.alipayNotifyVerifyRequired === "true" ? " selected" : ""}>开启</option>
@@ -1708,10 +1714,12 @@ function settingsForm(config: AppConfig): string {
       <button type="button" onclick="generateAlipayKeyPair()">生成支付宝应用密钥对</button>
       <button type="button" onclick="copyAlipayPublicKey()">复制支付宝后台专用公钥</button>
     </div>
-    <label class="wide">支付宝后台专用应用公钥，复制到支付宝开放平台<textarea id="alipay-app-public-key-text" readonly placeholder="点击“生成支付宝应用密钥对”后这里会出现一整行公钥字符串">${escapeHtml(config.alipayAppPublicKeyText)}</textarea></label>
+    <div class="note wide" style="padding:0;">当前应用公钥：${secretPreview(config.alipayAppPublicKeyText)} ${config.alipayAppPublicKeyText ? `<button type="button" onclick="copyAlipayPublicKey()">复制应用公钥</button>` : ""}</div>
+    <label class="wide">应用公钥，复制到支付宝开放平台<textarea id="alipay-app-public-key-text" readonly placeholder="点击“生成支付宝应用密钥对”后这里会出现一整行公钥字符串">${escapeHtml(config.alipayAppPublicKeyText)}</textarea></label>
     <label class="wide">支付宝应用私钥 PEM，查账必填<textarea name="alipay_private_key_pem" placeholder="${secretPlaceholder(config.alipayPrivateKeyPem)}"></textarea></label>
+    <div class="note wide" style="padding:0; font-weight:700; color:#1f2937;">支付宝平台公钥：从支付宝开放平台复制到这里，用于通知验签。它不是上面的应用公钥。</div>
     <div class="note wide" style="padding:0;">当前支付宝公钥：${secretPreview(publicKeyText(config.alipayPublicKeyPem))} ${config.alipayPublicKeyPem ? `<button type="button" onclick="copyText('${escapeJs(publicKeyText(config.alipayPublicKeyPem))}')">复制支付宝公钥</button>` : ""}</div>
-    <label class="wide">支付宝公钥字符串，通知验签用<textarea name="alipay_public_key_text" placeholder="粘贴支付宝开放平台提供的支付宝公钥；可带或不带 BEGIN/END，保存时会自动处理"></textarea></label>
+    <label class="wide">支付宝公钥<textarea name="alipay_public_key_text" placeholder="粘贴支付宝开放平台提供的支付宝公钥字符串，保存时会自动处理格式"></textarea></label>
     </div>
 
     <button type="submit">保存设置</button>
